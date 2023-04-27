@@ -129,6 +129,7 @@ inline void return_stack(ContextualStack* s) {
 }
 
 inline void jump_stack(ContextualStack* from, ContextualStack* to) {
+    // bthread_jump_fcontext 函数是由汇编实现的，通过操作寄存器完成线程切换。
     bthread_jump_fcontext(&from->context, to->context, 0/*not skip remained*/);
 }
 

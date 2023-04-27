@@ -71,20 +71,25 @@ inline TaskControl* get_task_control() {
 }
 
 inline TaskControl* get_or_new_task_control() {
+    // 1. 全局变量 TC（g_task_control）初始化，原子变量
     butil::atomic<TaskControl*>* p = (butil::atomic<TaskControl*>*)&g_task_control;
+    // 2.1 通过原子变量进行 load ，取出 TC 指针，如果不为空，直接返回
     TaskControl* c = p->load(butil::memory_order_consume);
     if (c != NULL) {
         return c;
     }
-    BAIDU_SCOPED_LOCK(g_task_control_mutex);
+    // 2.2. 竞争加自旋锁，重复上一操作
+    BAIDU_SCOPED_LOCK(g_task_control_mutex);  // 全局锁
     c = p->load(butil::memory_order_consume);
     if (c != NULL) {
         return c;
     }
+    // 2. 走到这，说明TC确实为NULL，开始new一个
     c = new (std::nothrow) TaskControl;
     if (NULL == c) {
         return NULL;
     }
+    // 3. 用并发度 concurrency 来初始化全局 TC
     int concurrency = FLAGS_bthread_min_concurrency > 0 ?
         FLAGS_bthread_min_concurrency :
         FLAGS_bthread_concurrency;
@@ -93,6 +98,7 @@ inline TaskControl* get_or_new_task_control() {
         delete c;
         return NULL;
     }
+    // 4. 将全局 TC 存入原子变量中
     p->store(c, butil::memory_order_release);
     return c;
 }
@@ -118,6 +124,8 @@ static bool validate_bthread_min_concurrency(const char*, int32_t val) {
     }
 }
 
+
+// 这个 tls 变量表明当前线程所归属的 taskgroup ，如果为 null ，说明当前线程不是 bthread 。
 __thread TaskGroup* tls_task_group_nosignal = NULL;
 
 BUTIL_FORCE_INLINE int
@@ -125,10 +133,13 @@ start_from_non_worker(bthread_t* __restrict tid,
                       const bthread_attr_t* __restrict attr,
                       void * (*fn)(void*),
                       void* __restrict arg) {
+
+    // 获取 TaskControl 全局单例
     TaskControl* c = get_or_new_task_control();
     if (NULL == c) {
         return ENOMEM;
     }
+
     if (attr != NULL && (attr->flags & BTHREAD_NOSIGNAL)) {
         // Remember the TaskGroup to insert NOSIGNAL tasks for 2 reasons:
         // 1. NOSIGNAL is often for creating many bthreads in batch,
@@ -141,8 +152,9 @@ start_from_non_worker(bthread_t* __restrict tid,
         }
         return g->start_background<true>(tid, attr, fn, arg);
     }
-    return c->choose_one_group()->start_background<true>(
-        tid, attr, fn, arg);
+
+    // 随机选择一个 TaskGroup ，将当前协程加入其队列
+    return c->choose_one_group()->start_background<true>(tid, attr, fn, arg);
 }
 
 struct TidTraits {
@@ -185,11 +197,17 @@ int bthread_start_background(bthread_t* __restrict tid,
                              const bthread_attr_t* __restrict attr,
                              void * (*fn)(void*),
                              void* __restrict arg) {
+
+    // 取当前线程本地 task_group 变量
     bthread::TaskGroup* g = bthread::tls_task_group;
+
+    // 若非空，意味着本线程 tg 有效，直接走 g->start_background()
     if (g) {
         // start from worker
         return g->start_background<false>(tid, attr, fn, arg);
     }
+
+    // 否则，说明当前线程不是 bthread ，
     return bthread::start_from_non_worker(tid, attr, fn, arg);
 }
 

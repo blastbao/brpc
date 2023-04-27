@@ -56,34 +56,39 @@ void run_worker_startfn() {
     }
 }
 
+// 创建一个 TaskGroup ，对应一个 worker ，它始终阻塞运行在 tg->run_main_task() 函数上，直到退出。
 void* TaskControl::worker_thread(void* arg) {
+    // 1. TG 创建前的处理，里面是调用 g_worker_startfn 函数，可以通过 bthread_set_worker_startfn() 来设置这个回调函数，实际很少用到。
     run_worker_startfn();    
 #ifdef BAIDU_INTERNAL
     logging::ComlogInitializer comlog_initializer;
 #endif
-    
+
+    // 2. 获取 TC 的指针
     TaskControl* c = static_cast<TaskControl*>(arg);
+    // 2.1 创建一个 TG
     TaskGroup* g = c->create_group();
     TaskStatistics stat;
     if (NULL == g) {
         LOG(ERROR) << "Fail to create TaskGroup in pthread=" << pthread_self();
         return NULL;
     }
-    std::string worker_thread_name = butil::string_printf(
-        "brpc_worker:%d",
-        c->_next_worker_id.fetch_add(1, butil::memory_order_relaxed));
+
+    // 获取 worker_id
+    std::string worker_thread_name = butil::string_printf("brpc_worker:%d", c->_next_worker_id.fetch_add(1, butil::memory_order_relaxed));
     butil::PlatformThread::SetName(worker_thread_name.c_str());
-    BT_VLOG << "Created worker=" << pthread_self()
-            << " bthread=" << g->main_tid();
+    BT_VLOG << "Created worker=" << pthread_self() << " bthread=" << g->main_tid();
 
+    // 3.1 把刚刚创建的 TaskGroup 指针保存在 tls_task_group 中，tls_task_group 是一个线程变量，用于在启动协程时找对应的 TaskGroup 。
     tls_task_group = g;
+    // 3.2 worker 计数加 1
     c->_nworkers << 1;
+    // 4. [重要] TG 运行主任务（死循环）
     g->run_main_task();
-
+    // 5. TG 结束时返回状态信息，输出 stat 日志
     stat = g->main_stat();
-    BT_VLOG << "Destroying worker=" << pthread_self() << " bthread="
-            << g->main_tid() << " idle=" << stat.cputime_ns / 1000000.0
-            << "ms uptime=" << g->current_uptime_ns() / 1000000.0 << "ms";
+    BT_VLOG << "Destroying worker=" << pthread_self() << " bthread=" << g->main_tid() << " idle=" << stat.cputime_ns / 1000000.0 << "ms uptime=" << g->current_uptime_ns() / 1000000.0 << "ms";
+    // 6. 各种清理操作
     tls_task_group = NULL;
     g->destroy_self();
     c->_nworkers << -1;
@@ -91,16 +96,19 @@ void* TaskControl::worker_thread(void* arg) {
 }
 
 TaskGroup* TaskControl::create_group() {
+    // 1. new 出来一个 TaskGroup 指针
     TaskGroup* g = new (std::nothrow) TaskGroup(this);
     if (NULL == g) {
         LOG(FATAL) << "Fail to new TaskGroup";
         return NULL;
     }
+    // 2. 进行 TaskGroup 的初始化
     if (g->init(FLAGS_task_group_runqueue_capacity) != 0) {
         LOG(ERROR) << "Fail to init TaskGroup";
         delete g;
         return NULL;
     }
+    // 3. 将初始化成功的 TaskGroup 指针保存在 TaskControl 的 _groups 数组中
     if (_add_group(g) != 0) {
         delete g;
         return NULL;
@@ -165,8 +173,15 @@ int TaskControl::init(int concurrency) {
         LOG(ERROR) << "Fail to get global_timer_thread";
         return -1;
     }
-    
-    _workers.resize(_concurrency);   
+
+    // 保存 N 个 worker ，每个对应一个 pthread
+    _workers.resize(_concurrency);
+
+    // [核心]
+    // 调用 pthread_create() 创建了 N 个系统线程，N 就是前面提到的并发度：concurrency 。
+    //
+    // 每个 pthread 线程的回调函数为 `TaskControl::worker_thread`， 它是一个 static 函数（回调函数一般为 static ）。
+    // 在该函数中会创建了一个 TaskGroup 。
     for (int i = 0; i < _concurrency; ++i) {
         const int rc = pthread_create(&_workers[i], NULL, worker_thread, this);
         if (rc) {
@@ -174,6 +189,8 @@ int TaskControl::init(int concurrency) {
             return -1;
         }
     }
+
+
     _worker_usage_second.expose("bthread_worker_usage");
     _switch_per_second.expose("bthread_switch_second");
     _signal_per_second.expose("bthread_signal_second");
@@ -185,6 +202,7 @@ int TaskControl::init(int concurrency) {
     while (_ngroup == 0) {
         usleep(100);  // TODO: Elaborate
     }
+
     return 0;
 }
 
@@ -192,32 +210,35 @@ int TaskControl::add_workers(int num) {
     if (num <= 0) {
         return 0;
     }
+
     try {
         _workers.resize(_concurrency + num);
     } catch (...) {
         return 0;
     }
+
     const int old_concurency = _concurrency.load(butil::memory_order_relaxed);
     for (int i = 0; i < num; ++i) {
         // Worker will add itself to _idle_workers, so we have to add
         // _concurrency before create a worker.
         _concurrency.fetch_add(1);
-        const int rc = pthread_create(
-                &_workers[i + old_concurency], NULL, worker_thread, this);
+        const int rc = pthread_create(&_workers[i + old_concurency], NULL, worker_thread, this);
         if (rc) {
-            LOG(WARNING) << "Fail to create _workers[" << i + old_concurency
-                         << "], " << berror(rc);
+            LOG(WARNING) << "Fail to create _workers[" << i + old_concurency<< "], " << berror(rc);
             _concurrency.fetch_sub(1, butil::memory_order_release);
             break;
         }
     }
+
     // Cannot fail
     _workers.resize(_concurrency.load(butil::memory_order_relaxed));
     return _concurrency.load(butil::memory_order_relaxed) - old_concurency;
 }
 
 TaskGroup* TaskControl::choose_one_group() {
+    // 当前有多少 TaskGroup
     const size_t ngroup = _ngroup.load(butil::memory_order_acquire);
+    // 随机返回一个 TaskGroup
     if (ngroup != 0) {
         return _groups[butil::fast_rand_less_than(ngroup)];
     }
@@ -238,14 +259,20 @@ void TaskControl::stop_and_join() {
         _stop = true;
         _ngroup.exchange(0, butil::memory_order_relaxed); 
     }
+
+
     for (int i = 0; i < PARKING_LOT_NUM; ++i) {
         _pl[i].stop();
     }
+
     // Interrupt blocking operations.
+    // 停止 pthread
     for (size_t i = 0; i < _workers.size(); ++i) {
         interrupt_pthread(_workers[i]);
     }
+
     // Join workers
+    // 等待 pthread
     for (size_t i = 0; i < _workers.size(); ++i) {
         pthread_join(_workers[i], NULL);
     }
@@ -338,6 +365,8 @@ int TaskControl::_destroy_group(TaskGroup* g) {
     return 0;
 }
 
+
+
 bool TaskControl::steal_task(bthread_t* tid, size_t* seed, size_t offset) {
     // 1: Acquiring fence is paired with releasing fence in _add_group to
     // avoid accessing uninitialized slot of _groups.
@@ -353,11 +382,11 @@ bool TaskControl::steal_task(bthread_t* tid, size_t* seed, size_t offset) {
         TaskGroup* g = _groups[s % ngroup];
         // g is possibly NULL because of concurrent _destroy_group
         if (g) {
-            if (g->_rq.steal(tid)) {
+            if (g->_rq.steal(tid)) { // 无锁窃取
                 stolen = true;
                 break;
             }
-            if (g->_remote_rq.pop(tid)) {
+            if (g->_remote_rq.pop(tid)) { // 有锁窃取
                 stolen = true;
                 break;
             }
@@ -367,6 +396,8 @@ bool TaskControl::steal_task(bthread_t* tid, size_t* seed, size_t offset) {
     return stolen;
 }
 
+
+// 当有新任务加入时，则调用 TaskControl::signal_task 通过 ParkingLog 唤醒等待的工作线程。
 void TaskControl::signal_task(int num_task) {
     if (num_task <= 0) {
         return;
@@ -375,9 +406,13 @@ void TaskControl::signal_task(int num_task) {
     // be created to match caller's requests. But in another side, there's also
     // many useless signalings according to current impl. Capping the concurrency
     // is a good balance between performance and timeliness of scheduling.
+    //
+    // 官方注释写明，限制并发可以更好地平衡性能和调度及时性，这里直接将唤醒的上限设为 2
     if (num_task > 2) {
         num_task = 2;
     }
+
+    // 通过 ParkingLog 唤醒
     int start_index = butil::fmix64(pthread_numeric_id()) % PARKING_LOT_NUM;
     num_task -= _pl[start_index].signal(1);
     if (num_task > 0) {
@@ -392,6 +427,7 @@ void TaskControl::signal_task(int num_task) {
         FLAGS_bthread_min_concurrency > 0 &&    // test min_concurrency for performance
         _concurrency.load(butil::memory_order_relaxed) < FLAGS_bthread_concurrency) {
         // TODO: Reduce this lock
+        // 当仍然有需要执行的任务时，尝试增加工作线程
         BAIDU_SCOPED_LOCK(g_task_control_mutex);
         if (_concurrency.load(butil::memory_order_acquire) < FLAGS_bthread_concurrency) {
             add_workers(1);

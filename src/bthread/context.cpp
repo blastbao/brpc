@@ -335,12 +335,24 @@ __asm (
 #endif
 
 #if defined(BTHREAD_CONTEXT_PLATFORM_linux_x86_64) && defined(BTHREAD_CONTEXT_COMPILER_gcc)
+
+
+// 首先，将当前协程的运行状态保存到当前协程的上下文中，并把目标协程的上下文加载进程序的栈空间中。
+// 接着，它会检查是否需要保存和加载浮点寄存器。
+// 最后，它会将当前协程的地址存储到指定的寄存器中，然后跳转到指定的协程开始执行。
+//
+// 这段代码使用了很多汇编语言的基本指令，比如 pushq、movq、jmp 等，
+// 同时也涉及到一些系统调用，比如 stmxcsr、fnstcw、ldmxcsr、fldcw 等，
+// 这些系统调用用于保存和加载浮点寄存器。
+//
+// 该函数通过汇编语言实现，可以提高协程切换的速度和效率。
 __asm (
 ".text\n"
 ".globl bthread_jump_fcontext\n"
 ".type bthread_jump_fcontext,@function\n"
 ".align 16\n"
 "bthread_jump_fcontext:\n"
+// 将 %rbp, %rbx, %r15, %r14, %r13, %r12 依次压入堆栈中，并将栈顶指针减去 8。
 "    pushq  %rbp  \n"
 "    pushq  %rbx  \n"
 "    pushq  %r15  \n"
@@ -348,18 +360,23 @@ __asm (
 "    pushq  %r13  \n"
 "    pushq  %r12  \n"
 "    leaq  -0x8(%rsp), %rsp\n"
-"    cmp  $0, %rcx\n"
-"    je  1f\n"
+// 比较 %rcx 和 0 的值，如果相等则跳转到标号 1，否则继续执行下一条指令。
+"    cmp  $0, %rcx\n"       // 判断是否有设置第四个参数
+"    je  1f\n"              // 如果第四个参数为 0 ，跳过
 "    stmxcsr  (%rsp)\n"
 "    fnstcw   0x4(%rsp)\n"
 "1:\n"
-"    movq  %rsp, (%rdi)\n"
-"    movq  %rsi, %rsp\n"
+// 在内存地址 %rdi 处存储当前线程的上下文，将 %rsp 的值赋给 %rsi。
+"    movq  %rsp, (%rdi)\n"  // 将当前栈顶指针保存到 from->context
+"    movq  %rsi, %rsp\n"    // 将当前栈顶设置为 to->context
+// 再次比较 %rcx 和 0 的值，如果相等则跳转到标号 2，否则继续执行下一条指令。
 "    cmp  $0, %rcx\n"
 "    je  2f\n"
+// 从内存地址 %rsp 处读取保存的 MXCSR 状态并将其加载到寄存器中，从内存地址 0x4(%rsp) 处读取保存的 FPU 控制字并将其加载到 FPU 控制寄存器中。
 "    ldmxcsr  (%rsp)\n"
 "    fldcw  0x4(%rsp)\n"
 "2:\n"
+// 将栈顶指针加上 8，并依次将 %r12, %r13, %r14, %r15, %rbx, %rbp 出栈。
 "    leaq  0x8(%rsp), %rsp\n"
 "    popq  %r12  \n"
 "    popq  %r13  \n"
@@ -368,9 +385,12 @@ __asm (
 "    popq  %rbx  \n"
 "    popq  %rbp  \n"
 "    popq  %r8\n"
+// 将 %rdx 的值复制给 %rax 和 %rdi。
 "    movq  %rdx, %rax\n"
 "    movq  %rdx, %rdi\n"
+// 使用 %r8 寄存器中保存的跳转地址来跳转到新的上下文中继续执行函数。
 "    jmp  *%r8\n"
+// 使用 .size 和 .section 等指令来定义函数的大小和 ELF 节信息，并将其与其他段进行合并。
 ".size bthread_jump_fcontext,.-bthread_jump_fcontext\n"
 ".section .note.GNU-stack,\"\",%progbits\n"
 ".previous\n"

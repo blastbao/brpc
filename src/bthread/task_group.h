@@ -75,12 +75,18 @@ public:
                          void* __restrict arg);
 
     // Suspend caller and run next bthread in TaskGroup *pg.
+    // 阻塞当前 bthread ，执行下一个就绪 bthread 。
     static void sched(TaskGroup** pg);
     static void ending_sched(TaskGroup** pg);
 
     // Suspend caller and run bthread `next_tid' in TaskGroup *pg.
     // Purpose of this function is to avoid pushing `next_tid' to _rq and
     // then being popped by sched(pg), which is not necessary.
+    //
+    //
+    //
+    //
+    //
     static void sched_to(TaskGroup** pg, TaskMeta* next_meta);
     static void sched_to(TaskGroup** pg, bthread_t next_tid);
     static void exchange(TaskGroup** pg, bthread_t next_tid);
@@ -88,6 +94,20 @@ public:
     // The callback will be run in the beginning of next-run bthread.
     // Can't be called by current bthread directly because it often needs
     // the target to be suspended already.
+    //
+    // 通过调用 set_remained 方法，用户可以将一个需要延迟执行的函数注册到当前任务组中。
+    // 当该任务组执行完成后，这个函数就会被放入到 g->_last_context_remained 列表中，等待下一次调度时执行。
+    //
+    // 一般情况下，set_remained 方法通常用于异步编程中。
+    // 例如，在进行异步 I/O 操作时，我们通常需要等待 I/O 完成后才能继续处理剩余工作。
+    // 在这种情况下，我们需要将剩余工作封装为一个函数，然后通过 set_remained 方法将这个函数注册到当前任务组中。
+    // 这个函数将被存储到 g->_last_context_remained 列表中，在 I/O 完成后被调用以完成后续操作。
+    //
+    // 一般来说，用户可以在 bthread_async 的回调函数或者其他需要异步处理的地方调用 set_remained 方法。
+    //
+    //
+    // 通常在使用 brpc 的协程编程时，可以通过 set_remained 函数向 _last_context_remained 和 _last_context_remained_arg 中添加要保存的 RemainedFn 回调函数和参数。
+    // 当执行 yield 或者发生其他协程切换时，就会先执行 RemainedFn 回调函数并传入相应的参数，再进行协程切换。
     typedef void (*RemainedFn)(void*);
     void set_remained(RemainedFn cb, void* arg) {
         _last_context_remained = cb;
@@ -194,6 +214,8 @@ friend class TaskControl;
     // of groups are postponed to avoid race.
     ~TaskGroup();
 
+    // sched_to 和 task_runner 是 brpc 框架中两个不同的函数，分别用于调度任务和执行任务。
+    // 它们之间的关系是 sched_to 负责将任务调度到工作线程中，而 task_runner 负责在工作线程中执行任务。
     static void task_runner(intptr_t skip_remained);
 
     // Callbacks for set_remained()
@@ -211,15 +233,20 @@ friend class TaskControl;
     // loop calling this function should end.
     bool wait_task(bthread_t* tid);
 
+    // 获取就绪协程
     bool steal_task(bthread_t* tid) {
+        // 先从自己的 _remote_rq 取 tid ，取到返回
         if (_remote_rq.pop(tid)) {
             return true;
         }
 #ifndef BTHREAD_DONT_SAVE_PARKING_STATE
+        // 获取不到 tid ，更新 _last_pl_state 取值以便于再次进入休眠。
         _last_pl_state = _pl->get_state();
 #endif
+        // 从全局 TC 来窃取任务
         return _control->steal_task(tid, &_steal_seed, _steal_offset);
     }
+
 
     TaskMeta* _cur_meta;
     
@@ -232,6 +259,27 @@ friend class TaskControl;
     int64_t _cumulated_cputime_ns;
 
     size_t _nswitch;
+
+    // 在 brpc 框架中，g->_last_context_remained 是 TaskGroup 类中保存所有未处理的协程上下文切换回调函数的指针。
+    //
+    // 在 sched_to 函数中，如果切换协程之前存在 g->_last_context_remained ，则在切换完协程后需要调用这些回调函数。
+    //
+    // 具体来说，当一个协程中使用了协程库提供的 co_yield 函数进行协程切换时，当前协程将进入挂起状态并保存相应的上下文信息。
+    // 然后，brpc 框架会将当前协程置于一个待处理列表中，并切换到下一个协程执行。
+    // 在下一次协程切换之前，如果当前协程还没有得到继续执行的机会，那么它的上下文信息就会被加入到 g->_last_context_remained 列表中。
+    //
+    // 而在下一次协程切换时，如果 g->_last_context_remained 中存在待处理的上下文信息，那么这些信息会被还原，并且相应的回调函数会被执行。
+    // 这样，程序就能够在多个协程之间正确地切换，并且保证上下文信息得到恢复和回调函数得到执行。
+
+    // 在 brpc 框架中，g->_last_context_remained 是 TaskGroup 类中的一个成员变量，用于记录上一个任务（即切换之前正在执行的任务）中尚未完成的操作。
+    // 如果在任务切换时发现有 _last_context_remained ，则需要先执行该函数指针指向的操作，然后再切换到下一个任务。
+    //
+    // 具体来说，_last_context_remained 是一个 RemainedFn 类型的函数指针，可以执行上一个任务中保存下来的一些需要继续执行的操作。
+    // 在 TaskGroup::sched_to() 中，如果存在_last_context_remained，则需要循环处理直至完成所有操作才能返回切换后的任务。
+    //
+    // 通过使用 _last_context_remained ，brpc 确保了应用程序在每个任务之间的状态转换没有失序或漏掉任何操作，并且避免了挂起和错误等异常情况。
+    // 在实际使用中，这种机制对提高应用程序的可靠性和稳定性非常重要。
+
     RemainedFn _last_context_remained;
     void* _last_context_remained_arg;
 
@@ -241,7 +289,15 @@ friend class TaskControl;
 #endif
     size_t _steal_seed;
     size_t _steal_offset;
+
+
+
+    //
+    //
     ContextualStack* _main_stack;
+
+
+
     bthread_t _main_tid;
     WorkStealingQueue<bthread_t> _rq;
     RemoteTaskQueue _remote_rq;

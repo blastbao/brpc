@@ -115,13 +115,32 @@ bool TaskGroup::is_stopped(bthread_t tid) {
     return true;
 }
 
+// 当前工作线程在窃取任务前会先取一次 ParkingLot 的状态，当状态发生改变时会直接跳过 wait 。
 bool TaskGroup::wait_task(bthread_t* tid) {
+
     do {
 #ifndef BTHREAD_DONT_SAVE_PARKING_STATE
+        // 已结束，退出
         if (_last_pl_state.stopped()) {
             return false;
         }
+
+        // [重要]
+        //
+        // 线程会阻塞在 _pl->wait(_last_pl_state) 等待唤醒。
+        // 当所有的 TaskGroup 都创建完毕后，使用 ready_to_run_remote 函数将协程任务加入到队列中并调用 signal_task 函数唤醒休眠的线程。
+        //
+        // _pl 是 ParkingLot* 类型，_last_plstate 是 pl 中的 state 。
+        // _pl->wait(_last_pl_state) 内部调用的 futex 做的 wait 操作，这里可以简单理解为阻塞等待被通知来终止阻塞，
+        // 当阻塞结束之后，执行 steal_task() 来进行工作窃取，如果窃取成功则返回。
         _pl->wait(_last_pl_state);
+
+        // 线程被唤醒后，开始获取 tid 。
+        //
+        // work stealing 不是协程的专利，更不是 Go 语言的专利。
+        // work stealing 是一种通用的实现负载均衡的算法。
+        // 这里的负载均衡说的不是像 Nginx 那种对于外部网络请求做负载均衡，此处指的是每个 CPU 处理任务时，每个核的负载均衡。
+        // 不止协程，其实线程池也可以做 work stealing 。
         if (steal_task(tid)) {
             return true;
         }
@@ -142,33 +161,50 @@ static double get_cumulated_cputime_from_this(void* arg) {
     return static_cast<TaskGroup*>(arg)->cumulated_cputime_ns() / 1000000000.0;
 }
 
+
+// 主循环：
+//  不断等待就绪协程，当获取到就绪协程 id 后，执行该协程。当无法获取到协程（当协程执行完了）时，该线程进入休眠，等待唤醒。
+//
+//
+// 主要步骤：
+//  1. wait_task()：获取有效任务（涉及工作窃取），出参 tid 会记录这个任务的 ID 号；
+//  2. sched_to()：进行栈、寄存器等运行时上下文的切换，为接下来运行的 tid 任务准备上下文。
+//  3. task_runner()：执行任务。
 void TaskGroup::run_main_task() {
-    bvar::PassiveStatus<double> cumulated_cputime(
-        get_cumulated_cputime_from_this, this);
+    bvar::PassiveStatus<double> cumulated_cputime(get_cumulated_cputime_from_this, this);
     std::unique_ptr<bvar::PerSecond<bvar::PassiveStatus<double> > > usage_bvar;
 
     TaskGroup* dummy = this;
     bthread_t tid;
+
+    // 每次获取一个待执行的 bthread ，若没有在 parkinglot 上睡眠等待唤醒
     while (wait_task(&tid)) {
+
+        // 切换到 tid 标记的 bthread 的上下文
         TaskGroup::sched_to(&dummy, tid);
+
         DCHECK_EQ(this, dummy);
         DCHECK_EQ(_cur_meta->stack, _main_stack);
+
+        // 执行任务
         if (_cur_meta->tid != _main_tid) {
             TaskGroup::task_runner(1/*skip remained*/);
         }
+
         if (FLAGS_show_per_worker_usage_in_vars && !usage_bvar) {
             char name[32];
 #if defined(OS_MACOSX)
             snprintf(name, sizeof(name), "bthread_worker_usage_%" PRIu64,
                      pthread_numeric_id());
 #else
-            snprintf(name, sizeof(name), "bthread_worker_usage_%ld",
-                     (long)syscall(SYS_gettid));
+            snprintf(name, sizeof(name), "bthread_worker_usage_%ld",(long)syscall(SYS_gettid));
 #endif
-            usage_bvar.reset(new bvar::PerSecond<bvar::PassiveStatus<double> >
-                             (name, &cumulated_cputime, 1));
+            usage_bvar.reset(new bvar::PerSecond<bvar::PassiveStatus<double> >(name, &cumulated_cputime, 1));
         }
     }
+    // 这里线程退出
+
+
     // Don't forget to add elapse of last wait_task.
     current_task()->stat.cputime_ns += butil::cpuwide_time_ns() - _last_run_ns;
 }
@@ -248,19 +284,66 @@ int TaskGroup::init(size_t runqueue_capacity) {
     return 0;
 }
 
+// 常见的协程调度策略：
+//  - 星切：主线程 --> 协程1 --> 主线程 --> 协程2 --> ... -->主线程
+//  - 环切：主线程 --> 协程1 --> 协程2 --> 协程3 --> ... -->主线程
+// 可以看出，环切比星切少了一半的切换次数，效率更高。
+// bthread 采用的是环切。
+
+//  虽然调用 bthread_start_* 创建新的 bthread 传入了上下文函数及其参数，但是 bthread 上不是直接运行该上下文函数，
+//  实际上运行的是 TaskGroup::task_runner 函数，步骤：
+//
+//   - 执行上一个 bthread 设置的 _last_context_remained 函数，可能是用来释放栈空间之类的。如果是在 worker pthread 的栈上运行 task ，这个步骤会跳过。
+//   - 运行上下文函数。执行过程中可能有多次跳出、跳回过程，所在的 worker pthread 可能也变了。
+//   - 执行完之后，执行一些清理动作，例如释放tls等。
+//   - 设置下一个 bthread 需要运行的 _last_context_remained 函数。
+//   - 找到下一个可以运行的 bthread ，查找次序依次为本地队列，远程队列，其它 TaskGroup 的本地队列或远程队列。
+//   - 如果没有找到，就返回 worker pthread 。
+//
+//  要注意，有两个地方会调用到 TaskGroup::task_runner 函数：
+//   - bthread 执行时，实际执行的是 TaskGroup::task_runner 函数，而在该函数里面调用上下文函数。
+//   - worker pthread 执行 pthread task 时会调用 TaskGroup::task_runner 函数。
+//
+//  所以，两种情况下会回到 worker pthread ：
+//   - 没有需要执行的 bthread 。返回后，可以调用 TaskGroup::wait_task 从其它 TaskGroup 偷取任务。如果仍然没有，就休眠等待唤醒。
+//   - 下一个 task 使用的是 worker-pthread 的栈。
+//
+//  首先获取当前任务组对象 g，并检查是否有需要延迟执行的函数（即 RemainedFn 对象），如果有，就按顺序执行这些函数。
+//  然后，进入 do-while 循环。
+//      其中，每次循环会从 g 的任务队列中取出下一个任务，并执行它的 user function（即 m->fn(m->arg)）。
+//      如果 user function 抛出了 ExitException 异常，则将异常中的值作为线程返回值；否则，返回值就是 user function 的返回值。
+//      接着，在执行 user function 后，会进行一些清理工作。
+//          具体来说，会清空 TLS 中存储的 KeyTable 对象，并将其归还给对象池；
+//          同时，会增加版本号，唤醒所有等待 join 的线程。
+//      最后，会将当前任务组对象 g 返回到其父级任务组中。
+//  循环执行到任务队列中的下一个任务的 tid 等于 g->_main_tid 时，循环结束。
+
+// bthread 工作线程在执行过程中会有以下几种状态：
+//  执行主协程任务，负责获取任务或者挂起等待，此时：
+//      _cur_meta->tid == _main_tid
+//      _cur_meta->stack == _main_stack
+//  执行 pthread 任务，直接在主协程中调用 TaskGroup::task_runner(1) 执行，此时：
+//      _cur_meta->tid != _main_tid
+//      _cur_meta->stack == _main_stack
+//  执行 bthread 任务，通过在 TaskGroup::sched_to 中调用 jump_stack 切换到协程栈，此时：
+//      _cur_meta->tid != _main_tid
+//      _cur_meta->stack != _main_stack
+//
+// 上述三种状态可以相互切换。
+
 void TaskGroup::task_runner(intptr_t skip_remained) {
-    // NOTE: tls_task_group is volatile since tasks are moved around
-    //       different groups.
+
+    // NOTE: tls_task_group is volatile since tasks are moved around different groups.
     TaskGroup* g = tls_task_group;
 
     if (!skip_remained) {
+        // 用户函数执行前，先执行可能存在的 remained 函数
         while (g->_last_context_remained) {
             RemainedFn fn = g->_last_context_remained;
             g->_last_context_remained = NULL;
             fn(g->_last_context_remained_arg);
             g = tls_task_group;
         }
-
 #ifndef NDEBUG
         --g->_sched_recursive_guard;
 #endif
@@ -276,29 +359,33 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
         // abnormally.
 
         // Meta and identifier of the task is persistent in this run.
+        //
+        // 通过 TLS 获取当前线程待执行的任务 TaskMeta
         TaskMeta* const m = g->_cur_meta;
 
         if (FLAGS_show_bthread_creation_in_vars) {
             // NOTE: the thread triggering exposure of pending time may spend
             // considerable time because a single bvar::LatencyRecorder
             // contains many bvar.
-            g->_control->exposed_pending_time() <<
-                (butil::cpuwide_time_ns() - m->cpuwide_start_ns) / 1000L;
+            g->_control->exposed_pending_time() << (butil::cpuwide_time_ns() - m->cpuwide_start_ns) / 1000L;
         }
 
         // Not catch exceptions except ExitException which is for implementing
         // bthread_exit(). User code is intended to crash when an exception is
         // not caught explicitly. This is consistent with other threading
         // libraries.
+        //
+        // 执行 bthread 中的回调函数
         void* thread_return;
         try {
+            // 执行用户执行的 bthread 任务，假设中途协程调用 yield 主动挂起
             thread_return = m->fn(m->arg);
         } catch (ExitException& e) {
             thread_return = e.value();
         }
 
         // Group is probably changed
-        g =  BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
+        g = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
 
         // TODO: Save thread_return
         (void)thread_return;
@@ -307,13 +394,14 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
         // use bthread local storage internally, or will cause memory leak.
         // FIXME: the time from quiting fn to here is not counted into cputime
         if (m->attr.flags & BTHREAD_LOG_START_AND_FINISH) {
-            LOG(INFO) << "Finished bthread " << m->tid << ", cputime="
-                      << m->stat.cputime_ns / 1000000.0 << "ms";
+            LOG(INFO) << "Finished bthread " << m->tid << ", cputime=" << m->stat.cputime_ns / 1000000.0 << "ms";
         }
 
         // Clean tls variables, must be done before changing version_butex
         // otherwise another thread just joined this thread may not see side
         // effects of destructing tls variables.
+        //
+        // 清理 bthread 局部变量
         KeyTable* kt = tls_bls.keytable;
         if (kt != NULL) {
             return_keytable(m->attr.keytable_pool, kt);
@@ -326,16 +414,23 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
         // is 0, change it to 1 to make bthread_t never be 0. Any access
         // or join to the bthread after changing version will be rejected.
         // The spinlock is for visibility of TaskGroup::get_attr.
+        //
+        // 累加版本号，且版本号不能为 0
         {
             BAIDU_SCOPED_LOCK(m->version_lock);
             if (0 == ++*m->version_butex) {
                 ++*m->version_butex;
             }
         }
+
+        // 唤醒 joiner
         butex_wake_except(m->version_butex, 0);
 
+        // _nbthreads 减 1
         g->_control->_nbthreads << -1;
         g->set_remained(TaskGroup::_release_last_context, m);
+
+        // 查找下一个任务，并切换到其对应的运行时上下文
         ending_sched(&g);
 
     } while (g->_cur_meta->tid != g->_main_tid);
@@ -418,9 +513,11 @@ int TaskGroup::start_background(bthread_t* __restrict th,
                                 const bthread_attr_t* __restrict attr,
                                 void * (*fn)(void*),
                                 void* __restrict arg) {
+
     if (__builtin_expect(!fn, 0)) {
         return EINVAL;
     }
+
     const int64_t start_ns = butil::cpuwide_time_ns();
     const bthread_attr_t using_attr = (attr ? *attr : BTHREAD_ATTR_NORMAL);
     butil::ResourceId<TaskMeta> slot;
@@ -535,6 +632,7 @@ void TaskGroup::ending_sched(TaskGroup** pg) {
             // transfered stack is just _main_stack.
             next_meta->set_stack(cur_meta->release_stack());
         } else {
+
             ContextualStack* stk = get_stack(next_meta->stack_type(), task_runner);
             if (stk) {
                 next_meta->set_stack(stk);
@@ -560,13 +658,29 @@ void TaskGroup::sched(TaskGroup** pg) {
 #else
     const bool popped = g->_rq.steal(&next_tid);
 #endif
+
+    // 若本 _rq 不存在，且无法 steal 一个就绪 bthread ，则切换到 _main 去执行
     if (!popped && !g->steal_task(&next_tid)) {
         // Jump to main task if there's no task to run.
         next_tid = g->_main_tid;
     }
+
+    // 切换协程
     sched_to(pg, next_tid);
 }
 
+// 这段代码是 TaskGroup 类中的调度方法 sched_to，用于切换当前正在执行的任务到另一个任务上，并且记录一些指标信息。
+//
+// 该函数会将当前线程从当前执行的 TaskMeta 对象切换到 next_meta 指向的 TaskMeta 对象。
+//
+// 接下来，函数通过 jump_stack() 函数执行协程栈之间的跳转，将当前的协程切换到下一个协程中。
+// 如果当前任务的协程栈不为空，则检查当前任务的协程是否为下一个任务所在的协程栈。
+// 如果两个任务运行在不同的协程栈中，则需要跳转到下一个协程栈中执行。
+// 如果两个任务运行在相同的协程栈中，则会触发 FATAL 错误，因为同一协程内无法调用自身。
+// 最后，函数执行 last_context_remained 列表中的所有回调，将其从列表中删除。
+// 最后一步是恢复 errno 和 tls_unique_user_ptr 两个变量的值，然后将当前 TaskGroup 对象指针 g 更新到 pg 所指向的地址中。
+//
+//
 void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
     TaskGroup* g = *pg;
 #ifndef NDEBUG
@@ -575,54 +689,79 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
                    << ") call sched_to(" << g << ")";
     }
 #endif
+
     // Save errno so that errno is bthread-specific.
+    // 保存当前的 errno 和 tls_unique_user_ptr，以防止在后续操作中被修改。
     const int saved_errno = errno;
     void* saved_unique_user_ptr = tls_unique_user_ptr;
 
+    // 获取当前正在执行的 bthread meta ，更新当前 BThread 的 CPU 时间、线程切换次数以及该 TaskGroup 线程池总共的线程切换次数
     TaskMeta* const cur_meta = g->_cur_meta;
     const int64_t now = butil::cpuwide_time_ns();
     const int64_t elp_ns = now - g->_last_run_ns;
     g->_last_run_ns = now;
     cur_meta->stat.cputime_ns += elp_ns;
-    if (cur_meta->tid != g->main_tid()) {
+    if (cur_meta->tid != g->main_tid()) {     // 如果当前任务不是主线程，需要累加该任务的 CPU 时间
         g->_cumulated_cputime_ns += elp_ns;
     }
-    ++cur_meta->stat.nswitch;
-    ++ g->_nswitch;
+    ++cur_meta->stat.nswitch; // 更新当前 bthread 切换次数
+    ++ g->_nswitch; // 更新全局切换次数
+
     // Switch to the task
+    // 如果下一个任务不是当前正在运行的任务，则切换到下一个任务对应的上下文。
     if (__builtin_expect(next_meta != cur_meta, 1)) {
+        // 将当前的 meta 设置为下一个 bthread 的 meta；
         g->_cur_meta = next_meta;
+
         // Switch tls_bls
+        // bthread 具备内存类似 pthread 的 tls
+        // 将当前任务的本地存储（local_storage）赋值给当前 meta ，将下一个任务的本地存储赋值给 tls_bls ；
         cur_meta->local_storage = tls_bls;
         tls_bls = next_meta->local_storage;
 
         // Logging must be done after switching the local storage, since the logging lib
         // use bthread local storage internally, or will cause memory leak.
-        if ((cur_meta->attr.flags & BTHREAD_LOG_CONTEXT_SWITCH) ||
-            (next_meta->attr.flags & BTHREAD_LOG_CONTEXT_SWITCH)) {
-            LOG(INFO) << "Switch bthread: " << cur_meta->tid << " -> "
-                      << next_meta->tid;
+        if ((cur_meta->attr.flags & BTHREAD_LOG_CONTEXT_SWITCH) || (next_meta->attr.flags & BTHREAD_LOG_CONTEXT_SWITCH)) {
+            LOG(INFO) << "Switch bthread: " << cur_meta->tid << " -> "<< next_meta->tid;
         }
 
+        // 如果当前任务有栈空间（stack == NULL），意味着当前任务是主线程，则跳过此步操作。
+        // 如果当前任务有栈空间（stack != NULL），则判断下一个任务是否与当前任务在相同的栈空间中。
+        // 如果不是，则需要使用 jump_stack 函数切换到下一个任务的栈空间。
+        // 需要注意的是，有可能被切换的任务属于其他 TaskGroup 对象，因此需要重新将 g 赋值为 BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group)；
         if (cur_meta->stack != NULL) {
             if (next_meta->stack != cur_meta->stack) {
+                // 若 next_meta 有自己的栈，jump_stack 切换到 next_meta 的栈
+                // jump_stack 是一段汇编代码，主要作用是栈和寄存器切换
                 jump_stack(cur_meta->stack, next_meta->stack);
+
+                // [重要]
+
+                // cur_meta 再次得到调度，从这里开始执行，由于 bthread 允许偷任务，可能此时是其他工作线程在执行，需要切换
                 // probably went to another group, need to assign g again.
                 g = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
             }
 #ifndef NDEBUG
             else {
+                // 一个 pthread_task 切换到另一个 pthread_task ，只能在工作线程的栈上发生
+
                 // else pthread_task is switching to another pthread_task, sc
                 // can only equal when they're both _main_stack
                 CHECK(cur_meta->stack == g->_main_stack);
             }
 #endif
         }
+
         // else because of ending_sched(including pthread_task->pthread_task)
+        // 如果当前任务没有栈空间，则说明该任务已经被结束或者切换到了 pthread 线程中。
+
     } else {
+        // 如果当前任务和下一个任务相同，则抛出 FATAL 错误。
         LOG(FATAL) << "bthread=" << g->current_tid() << " sched_to itself!";
     }
 
+
+    // g->_last_context_remained 变量表示上一个 context 中剩余的任务
     while (g->_last_context_remained) {
         RemainedFn fn = g->_last_context_remained;
         g->_last_context_remained = NULL;
@@ -630,6 +769,7 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
         g = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
     }
 
+    // 还原 errno 和 unique_user_ptr 等线程相关属性
     // Restore errno
     errno = saved_errno;
     // tls_unique_user_ptr probably changed.
@@ -638,6 +778,8 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
 #ifndef NDEBUG
     --g->_sched_recursive_guard;
 #endif
+
+    // 更新 pg 指向新的任务组 TaskGroup 对象，将其置为当前线程所在的 TaskGroup。
     *pg = g;
 }
 
@@ -653,15 +795,17 @@ void TaskGroup::destroy_self() {
 void TaskGroup::ready_to_run(bthread_t tid, bool nosignal) {
     push_rq(tid);
     if (nosignal) {
-        ++_num_nosignal;
+        ++_num_nosignal; // 对于设定了不触发信号的任务，仅增加计数
     } else {
         const int additional_signal = _num_nosignal;
         _num_nosignal = 0;
         _nsignaled += 1 + additional_signal;
+        // 调用 signal_task 唤醒
         _control->signal_task(1 + additional_signal);
     }
 }
 
+// 将还没有触发信号的任务统一触发信号（工作线程内调用）
 void TaskGroup::flush_nosignal_tasks() {
     const int val = _num_nosignal;
     if (val) {
@@ -671,12 +815,12 @@ void TaskGroup::flush_nosignal_tasks() {
     }
 }
 
+// 从工作线程外提交任务
 void TaskGroup::ready_to_run_remote(bthread_t tid, bool nosignal) {
     _remote_rq._mutex.lock();
     while (!_remote_rq.push_locked(tid)) {
         flush_nosignal_tasks_remote_locked(_remote_rq._mutex);
-        LOG_EVERY_SECOND(ERROR) << "_remote_rq is full, capacity="
-                                << _remote_rq.capacity();
+        LOG_EVERY_SECOND(ERROR) << "_remote_rq is full, capacity=" << _remote_rq.capacity();
         ::usleep(1000);
         _remote_rq._mutex.lock();
     }
@@ -687,7 +831,7 @@ void TaskGroup::ready_to_run_remote(bthread_t tid, bool nosignal) {
         const int additional_signal = _remote_num_nosignal;
         _remote_num_nosignal = 0;
         _remote_nsignaled += 1 + additional_signal;
-        _remote_rq._mutex.unlock();
+        _remote_rq._mutex.unlock();  // 锁的生命周期内也保护了计数相关变量
         _control->signal_task(1 + additional_signal);
     }
 }
@@ -889,6 +1033,7 @@ int TaskGroup::interrupt(bthread_t tid, TaskControl* c) {
 }
 
 void TaskGroup::yield(TaskGroup** pg) {
+    // yield 时将当前的 bthread 任务打包为 remained 函数
     TaskGroup* g = *pg;
     ReadyToRunArgs args = { g->current_tid(), false };
     g->set_remained(ready_to_run_in_worker, &args);
