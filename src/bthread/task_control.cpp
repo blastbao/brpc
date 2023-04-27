@@ -382,6 +382,7 @@ bool TaskControl::steal_task(bthread_t* tid, size_t* seed, size_t offset) {
         TaskGroup* g = _groups[s % ngroup];
         // g is possibly NULL because of concurrent _destroy_group
         if (g) {
+            //
             if (g->_rq.steal(tid)) { // 无锁窃取
                 stolen = true;
                 break;

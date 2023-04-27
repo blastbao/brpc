@@ -287,7 +287,7 @@ friend class TaskControl;
 #ifndef BTHREAD_DONT_SAVE_PARKING_STATE
     ParkingLot::State _last_pl_state;
 #endif
-    size_t _steal_seed;
+    size_t _steal_seed;     // 随机数
     size_t _steal_offset;
 
 
