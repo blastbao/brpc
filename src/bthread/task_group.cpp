@@ -734,10 +734,14 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
                 // jump_stack 是一段汇编代码，主要作用是栈和寄存器切换
                 jump_stack(cur_meta->stack, next_meta->stack);
 
-                // [重要]
 
-                // cur_meta 再次得到调度，从这里开始执行，由于 bthread 允许偷任务，可能此时是其他工作线程在执行，需要切换
+                /// [重要]
+                /// ... 重新调度，从这里继续执行
+
+
                 // probably went to another group, need to assign g again.
+                //
+                // 因为 work stealing 的存在，任务可能被换到其他线程了，worker 会变化，这里重置。
                 g = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
             }
 #ifndef NDEBUG

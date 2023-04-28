@@ -28,6 +28,24 @@
 #include "bthread/list_of_abafree_id.h"
 #include "bthread/bthread.h"
 
+
+
+// Q: 当前正在执行的 bthread 还没有执行完，会切换到下一个 bthread 上去吗？
+// A:
+//
+//  只有在 bthread 内部回调函数中执行了 bthread 同步原语相关的操作，才会引发切换，比如 bthread_sleep 或者 bthread 的 mutex ，
+//  或者执行了 channel 的异步 IO 等等。
+//  正常纯计算逻辑，是不会被切换的。
+//
+//  只有被挂起的时候才会切换，一般就是因为 IO 。
+//  比如在使用 brpc 的 channel 异步请求下游服务或 redis 的时候，在对方 response 返回之前，会切换 bthread 。
+//  正常的如果在执行串行的计算逻辑不会切 bthread 。
+//
+
+
+
+
+
 namespace bthread {
 
 DEFINE_int32(bthread_concurrency, 8 + BTHREAD_EPOLL_THREAD_NUM,
