@@ -283,10 +283,13 @@ friend class TaskControl;
     RemainedFn _last_context_remained;
     void* _last_context_remained_arg;
 
+
     ParkingLot* _pl;
 #ifndef BTHREAD_DONT_SAVE_PARKING_STATE
     ParkingLot::State _last_pl_state;
 #endif
+
+
     size_t _steal_seed;     // 随机数
     size_t _steal_offset;
 
@@ -299,8 +302,13 @@ friend class TaskControl;
 
 
     bthread_t _main_tid;
+
+
+    // 存储 worker pthread 创建的 bthread ，队列中的 bthread 可能被其他 TaskGroup 偷取。
     WorkStealingQueue<bthread_t> _rq;
+    // 存储 non-worker pthread 创建的 bthread ，队列中的 bthread 可能被其他 TaskGroup 偷取。
     RemoteTaskQueue _remote_rq;
+
     int _remote_num_nosignal;
     int _remote_nsignaled;
 

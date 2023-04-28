@@ -53,6 +53,24 @@ int allocate_stack_storage(StackStorage* s, int stacksize, int guardsize);
 // corresponding allocate_stack_storage() otherwise behavior is undefined.
 void deallocate_stack_storage(StackStorage* s);
 
+
+
+//      栈类型	                说明	                            大小
+//  STACK_TYPE_MAIN	    worker pthread的栈	                默认大小是8MB
+//  STACK_TYPE_PTHREAD	使用worker pthread的栈，不需要额外分配	默认大小是8MB
+//  STACK_TYPE_SMALL	小型栈	                            32KB
+//  STACK_TYPE_NORMAL	默认栈	                            1MB
+//  STACK_TYPE_LARGE	大型栈	                            8MB
+//
+// 调用 bthread_start_* 创建的 bthread 默认情况下栈大小是 1MB（STACK_TYPE_NORMAL），可通过 attr 参数来选择栈的大小。
+// 如果分配栈空间失败，将其栈类型改为 STACK_TYPE_PTHREAD ，即直接在 worker pthread 的栈上运行该 bthread 。
+// 另外，pthread task 的栈类型也是 STACK_TYPE_PTHREAD 。
+//
+// 注意，worker pthread 的栈不是 brpc 分配的，不能释放它。
+// 至于 STACK_TYPE_MAIN，是为了告诉 get_stack 函数只需要分配栈控制结构，不需要分配栈空间，因为 worker pthread 已经由系统线程库分配了栈空间。
+//
+// 这里要注意，创建 bthread 时没有立刻为其分配栈，直到第一次运行时才会分配。
+// 这个便于我们优化内存的使用，如果前一个 bthread 即将退出并且栈类型和下一个 bthread 相同，我们可以直接转移栈而不需要重新分配。
 enum StackType {
     STACK_TYPE_MAIN = 0,
     STACK_TYPE_PTHREAD = BTHREAD_STACKTYPE_PTHREAD,

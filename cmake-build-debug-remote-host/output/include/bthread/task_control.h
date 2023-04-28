@@ -33,11 +33,22 @@
 #include "bthread/work_stealing_queue.h"        // WorkStealingQueue
 #include "bthread/parking_lot.h"
 
+
+
+
+
+
+
+
 namespace bthread {
 
 class TaskGroup;
 
 // Control all task groups
+//
+// 一个 TaskGroup 对应一个 worker ，也即一个 pthread ，用于管理一组协程。所有的 TaskGroup 由一个 TaskControl 的单例控制。
+//
+// TaskMeta 保存的是一个协程的上下问，包括需要执行的函数，函数参数，堆栈内容，协程id，状态，还有和锁相关的内容，
 class TaskControl {
     friend class TaskGroup;
 

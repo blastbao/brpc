@@ -26,11 +26,20 @@
 #include "butil/atomicops.h"
 #include "butil/logging.h"
 
+// WorkStealingQueue 是一种无锁队列，用做 bthread 中的任务队列。
+// WorkStealingQueue 提供三种操作：push，pop，steal。
+//
+// 由于 push 和 pop 都是在本线程中完成的，因此 push 和 pop 操作不会并发，两个 push 和两个 pop 之间也不会并发；
+// 但是 steal 是从其他线程发起的，因此会和 push 或 pop 并发。
+//
+//
+// 队列 Queue 的头尾指针 _top 和 _bottom ，push 操作在 _bottom 侧执行，pop 操作在 _bottom 侧执行，steal 操作在 _top 侧执行。
 namespace bthread {
 
 template <typename T>
 class WorkStealingQueue {
 public:
+
     WorkStealingQueue()
         : _bottom(1)
         , _capacity(0)

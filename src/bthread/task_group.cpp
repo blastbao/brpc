@@ -127,15 +127,15 @@ bool TaskGroup::wait_task(bthread_t* tid) {
 
         // [重要]
         //
-        // 线程会阻塞在 _pl->wait(_last_pl_state) 等待唤醒。
-        // 当所有的 TaskGroup 都创建完毕后，使用 ready_to_run_remote 函数将协程任务加入到队列中并调用 signal_task 函数唤醒休眠的线程。
+        // _pl._pending_signal 的值和 _last_pl_state.val 相等则阻塞，不等则返回。
         //
-        // _pl 是 ParkingLot* 类型，_last_plstate 是 pl 中的 state 。
-        // _pl->wait(_last_pl_state) 内部调用的 futex 做的 wait 操作，这里可以简单理解为阻塞等待被通知来终止阻塞，
-        // 当阻塞结束之后，执行 steal_task() 来进行工作窃取，如果窃取成功则返回。
+        // 注意，这里 _pl._pending_signal 和 _last_pl_state.val 的具体取值没有意义，主要是用来检测变化，
+        // 也就是说，如果自上次 steal_task() 执行之后，这个值没有变化，也就意味着过程中没有新增的协程，
+        // 也就不需要马上再次执行 steal_task() ，而是进入阻塞状态，等待被新增协程的事件唤醒。
         _pl->wait(_last_pl_state);
 
-        // 线程被唤醒后，开始获取 tid 。
+
+        // 被唤醒后，意味着可能有新增协程等待执行，尝试执行 steal_task() 来获取。
         //
         // work stealing 不是协程的专利，更不是 Go 语言的专利。
         // work stealing 是一种通用的实现负载均衡的算法。
@@ -161,10 +161,9 @@ static double get_cumulated_cputime_from_this(void* arg) {
     return static_cast<TaskGroup*>(arg)->cumulated_cputime_ns() / 1000000000.0;
 }
 
-
 // 主循环：
-//  不断等待就绪协程，当获取到就绪协程 id 后，执行该协程。当无法获取到协程（当协程执行完了）时，该线程进入休眠，等待唤醒。
-//
+//  不断等待就绪协程，当获取到就绪协程 id 后，执行该协程。
+//  当无法获取到协程（当协程执行完了）时，该线程进入休眠，等待唤醒。
 //
 // 主要步骤：
 //  1. wait_task()：获取有效任务（涉及工作窃取），出参 tid 会记录这个任务的 ID 号；
@@ -231,6 +230,8 @@ TaskGroup::TaskGroup(TaskControl* c)
 {
     _steal_seed = butil::fast_rand();
     _steal_offset = OFFSET_TABLE[_steal_seed % ARRAY_SIZE(OFFSET_TABLE)];
+
+    // 根据线程号哈希到某个 ParkingLot 对象上
     _pl = &c->_pl[butil::fmix64(pthread_numeric_id()) % TaskControl::PARKING_LOT_NUM];
     CHECK(c);
 }
@@ -659,13 +660,13 @@ void TaskGroup::sched(TaskGroup** pg) {
     const bool popped = g->_rq.steal(&next_tid);
 #endif
 
-    // 若本 _rq 不存在，且无法 steal 一个就绪 bthread ，则切换到 _main 去执行
+    // 若本 _rq 不存在，且无法从其它 tg steal 一个就绪 bthread ，则切换到 _main 去执行
     if (!popped && !g->steal_task(&next_tid)) {
         // Jump to main task if there's no task to run.
         next_tid = g->_main_tid;
     }
 
-    // 切换协程
+    // 切换到目标协程或者 _main 协程
     sched_to(pg, next_tid);
 }
 
@@ -680,7 +681,6 @@ void TaskGroup::sched(TaskGroup** pg) {
 // 最后，函数执行 last_context_remained 列表中的所有回调，将其从列表中删除。
 // 最后一步是恢复 errno 和 tls_unique_user_ptr 两个变量的值，然后将当前 TaskGroup 对象指针 g 更新到 pg 所指向的地址中。
 //
-//
 void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
     TaskGroup* g = *pg;
 #ifndef NDEBUG
@@ -689,7 +689,6 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
                    << ") call sched_to(" << g << ")";
     }
 #endif
-
     // Save errno so that errno is bthread-specific.
     // 保存当前的 errno 和 tls_unique_user_ptr，以防止在后续操作中被修改。
     const int saved_errno = errno;
@@ -815,19 +814,37 @@ void TaskGroup::flush_nosignal_tasks() {
     }
 }
 
-// 从工作线程外提交任务
+
+// 本函数的作用是将 tid 标识的线程加入到远程任务队列中，如果任务队列已满，则进行等待，并在一定时间间隔后重试。
+// 如果 nosignal 设置为 true ，表示当前线程不需要接收信号，否则会给其它线程发送信号。
 void TaskGroup::ready_to_run_remote(bthread_t tid, bool nosignal) {
     _remote_rq._mutex.lock();
+
+
+
+    // [重要]
+    //
+    // while 循环入队，失败就执行 flush_nosignal_tasks_remote_locked() 然后休眠 1ms ，然后重新尝试入队。
+    // 这里入队失败的唯一原因就是 remote_rq 的容量满了。flush_nosignal_tasks_remote_locked() 的操作也无非就是发出一个信号，
+    // 让 remote_rq 中的任务（TM/bthread) 尽快被消费掉，给新的任务入队留出空间。
+    // 另外 flush_nosignal_tasks_remote_locked() 内会做解锁操作，所以休眠 1ms 之后需要重新加锁。
     while (!_remote_rq.push_locked(tid)) {
         flush_nosignal_tasks_remote_locked(_remote_rq._mutex);
         LOG_EVERY_SECOND(ERROR) << "_remote_rq is full, capacity=" << _remote_rq.capacity();
         ::usleep(1000);
         _remote_rq._mutex.lock();
     }
+    // 在 while 结束之后，表示新任务已经入队。
+
+
+
+    // 是否需要发送信号通知有新的任务可以处理。
     if (nosignal) {
+        // 如果不需发送信号，则直接更新 _remote_num_nosignal 计数器，表示当前有一个新任务待处理。
         ++_remote_num_nosignal;
         _remote_rq._mutex.unlock();
     } else {
+        // 如果需要发送信号，当前有 1 + additional_signal 个任务待处理，通知其他人来消费。
         const int additional_signal = _remote_num_nosignal;
         _remote_num_nosignal = 0;
         _remote_nsignaled += 1 + additional_signal;
@@ -845,6 +862,8 @@ void TaskGroup::flush_nosignal_tasks_remote_locked(butil::Mutex& locked_mutex) {
     _remote_num_nosignal = 0;
     _remote_nsignaled += val;
     locked_mutex.unlock();
+
+    //
     _control->signal_task(val);
 }
 
@@ -872,31 +891,60 @@ void TaskGroup::ready_to_run_in_worker_ignoresignal(void* args_in) {
     return tls_task_group->push_rq(args->tid);
 }
 
+// 睡眠参数
 struct SleepArgs {
-    uint64_t timeout_us;
-    bthread_t tid;
-    TaskMeta* meta;
-    TaskGroup* group;
+    uint64_t timeout_us;    // 休眠时间
+    bthread_t tid;          // 协程 ID
+    TaskMeta* meta;         // 协程 信息
+    TaskGroup* group;       // 归属的 TaskGroup
 };
 
+// 定时器回调函数，用于将之前睡眠的协程唤醒并添加到可执行队列中等待下一次调度。
 static void ready_to_run_from_timer_thread(void* arg) {
     CHECK(tls_task_group == NULL);
     const SleepArgs* e = static_cast<const SleepArgs*>(arg);
     e->group->control()->choose_one_group()->ready_to_run_remote(e->tid);
 }
 
+
+// 具体来说：
+//
+// 首先通过调用 get_global_timer_thread() 函数获取全局的 TimerThread 实例，并使用 schedule 函数将当前协程的信息和休眠时间封装成 SleepArgs 结构体，注册到定时器队列中等待唤醒。
+// 同时，如果添加失败，则直接调用 ready_to_run 函数将当前协程唤醒并加入可执行队列，以保证程序正常运行。
+//
+// 对于添加成功的情况，如果当前协程没有被 interrupt 打断，并且在 version_butex 的版本号没有发生变化时，给当前协程的元数据文件 meta 设置 current_sleep 标记，表示当前协程处于睡眠状态。
+// 另外，由于 version_butex 是一个原子操作，因此需要使用 BAIDU_SCOPED_LOCK 宏完成线程安全。
+//
+// 如果当前协程已经被中断或者停止，则 unschedule 函数从定时器队列中移除当前协程的 sleep_id 任务，并调用 ready_to_run 函数将当前协程重新加入可执行队列中，以确保程序正常退出。
+// 如果该 sleep_id 任务正在执行中，则 ready_to_run_in_worker 函数也将再次调度之前的协程和任务来确保程序正常退出。
+//
+//
+// 这段代码是 TaskGroup 类中的 _add_sleep_event 函数的实现，主要用于在定时器中添加一个睡眠事件，并设置当前任务的睡眠状态。
+// 具体代码如下：
+//  将给定的 SleepArgs 结构体对象复制一份，并获取对应的 TaskGroup 对象。
+//  调用 TimerThread 的 schedule 函数，将处理函数 ready_to_run_from_timer_thread 和回调参数 void_args 以及超时时间 e.timeout_us 作为参数传入，添加一个定时器事件并返回该定时器的 ID。
+//  如果添加失败，则调用 TaskGroup 的 ready_to_run 函数，将指定任务添加到就绪队列中，并返回。
+//  设置当前任务的睡眠状态，即将定时器的 ID 赋值给 TaskMeta 的 current_sleep 字段。
+//  若赋值失败，则说明当前任务已被打断或停止，则调用 TimerThread 的 unschedule 函数取消定时器事件，并调用 TaskGroup 的 ready_to_run 函数将指定任务添加到就绪队列中。
+// 这段代码的主要作用是实现了在定时器中添加睡眠事件，并且考虑了线程的并发性和相应状态的同步问题，使得多个线程可以正确地使用 _add_sleep_event 函数。
+// 同时，代码中还利用了 RAII 的技术，利用 BAIDU_SCOPED_LOCK 宏封装了锁的获取和析构操作，使得锁的使用更加便捷和安全。
 void TaskGroup::_add_sleep_event(void* void_args) {
+
     // Must copy SleepArgs. After calling TimerThread::schedule(), previous
     // thread may be stolen by a worker immediately and the on-stack SleepArgs
     // will be gone.
     SleepArgs e = *static_cast<SleepArgs*>(void_args);
     TaskGroup* g = e.group;
 
-    TimerThread::TaskId sleep_id;
+    // 调用全局定时器线程，创建定时任务。
+    TimerThread::TaskId sleep_id;   // 计时器任务 id，可将其用于取消或重新安排计时器任务
     sleep_id = get_global_timer_thread()->schedule(
-        ready_to_run_from_timer_thread, void_args,
-        butil::microseconds_from_now(e.timeout_us));
+            ready_to_run_from_timer_thread,                             // 定时回调函数
+            void_args,                                                 // 定时回调参数
+            butil::microseconds_from_now(e.timeout_us)  // 唤醒时间点
+    );
 
+    // 如果 sleep_id 为空，则说明定时器任务添加失败，直接唤醒之前阻塞的协程并返回。
     if (!sleep_id) {
         // fail to schedule timer, go back to previous thread.
         g->ready_to_run(e.tid);
@@ -912,6 +960,7 @@ void TaskGroup::_add_sleep_event(void* void_args) {
             return;
         }
     }
+
     // The thread is stopped or interrupted.
     // interrupt() always sees that current_sleep == 0. It will not schedule
     // the calling thread. The race is between current thread and timer thread.
@@ -925,22 +974,64 @@ void TaskGroup::_add_sleep_event(void* void_args) {
         // have to do it again.
         g->ready_to_run(e.tid);
     }
+
 }
 
 // To be consistent with sys_usleep, set errno and return -1 on error.
+//
+// 首先，判断是否休眠时间为 0，如果是，则直接执行 yield(pg) 函数，让出当前协程的执行权，等待下一次唤醒。
+// 否则，创建一个 SleepArgs 结构体，并保存当前协程的相关信息和休眠时间，在调用 _add_sleep_event 函数向定时器队列中添加该事件。
+// 然后，调用 sched 函数，将当前协程加入可执行队列，并且切换到下一个要执行的协程。
+// 最后，判断 sleep 期间是否已被中断，如果中断则返回 -1 并设置 errno 为 EINTR 或者 ESTOP，否则返回 0。
+//
+// 需要说明的是，sleep 过程中可能会被 interrupt 函数打断。
+// 例如，在 RPC 系统中，当客户端或服务端输出大量数据时，可能会导致网络缓冲区满，从而触发应用程序发送阻塞，
+// 此时 bthread_usleep 函数就会因为超时被中断而退出当前睡眠，并进行阻塞处理。
+// 在这种情况下，可以通过设置 stop 标记来确保程序安全停止，并在 errno 中返回回递错误码 ESTOP，以提示应用程序正常退出。
+//
+//
+// 在 brpc 中，taskgroup::usleep 函数实现时必须先切到其他线程再设置定时器的原因如下：
+//
+//  - 避免阻塞：在 brpc 中，每个线程都有一个任务组，负责调度该线程执行的所有任务。
+//      如果某个任务调用了 usleep 函数进行休眠，而没有释放任务组锁，那么该线程将一直持有锁，导致其他的任务无法进入该线程运行，从而影响系统的并发性。
+//      为了避免这种情况的发生，usleep 需要释放当前任务组的锁。
+//
+//  - 设置定时器：在 usleep 内部，我们通过 schedule 函数来设置该任务的定时器，以便在一定时间后唤醒该任务。
+//      但是，由于当前线程持有了任务组的锁，因此不能直接操作其它的任务（包括定时器的设置）。
+//      所以，我们需要先释放任务组锁，让其他线程进入，然后再设置该任务的定时器。
+//
+// 综上所述，在 brpc 中，taskgroup::usleep 函数为了保证并发性和正确性，必须先切换到其他线程再设置定时器。
+//
 int TaskGroup::usleep(TaskGroup** pg, uint64_t timeout_us) {
     if (0 == timeout_us) {
         yield(pg);
         return 0;
     }
+
     TaskGroup* g = *pg;
+
     // We have to schedule timer after we switched to next bthread otherwise
     // the timer may wake up(jump to) current still-running context.
     SleepArgs e = { timeout_us, g->current_tid(), g->current_task(), g };
     g->set_remained(_add_sleep_event, &e);
+
+    // 然后，调用 sched 函数进行线程切换，将当前线程挂起等待。
+    // 这里要注意，必须先切到其他线程再设置定时器，否则可能出现定时器在当前线程执行的情况。
+    // 之后，再次获取 TaskGroup 对象 g ，并将 e.meta->current_sleep 设为 0 。
+
+    // 找一个就绪协程，jmp 过去运行
     sched(pg);
+
+    /// ... 恢复现场，继续执行
+
     g = *pg;
     e.meta->current_sleep = 0;
+
+    // 如果 e.meta->interrupted 是否为 true ，如果为 true ，说明在休眠过程中被打断了（比如收到了信号），
+    // 根据 e.meta->stop 的值，将 errno 设为 ESTOP 或 EINTR ，返回 -1 表示出错。
+    // 需要注意的是，将 errno 设置为 ESTOP 而不是 EINTR ，是为了跟标准的 Unix 信号处理方式保持一致。
+    //
+    // 如果 e.meta->interrupted 为 false ，则说明休眠时间结束，返回 0 表示正常结束。
     if (e.meta->interrupted) {
         // Race with set and may consume multiple interruptions, which are OK.
         e.meta->interrupted = false;
@@ -952,14 +1043,14 @@ int TaskGroup::usleep(TaskGroup** pg, uint64_t timeout_us) {
         errno = (e.meta->stop ? ESTOP : EINTR);
         return -1;
     }
+
     return 0;
 }
 
 // Defined in butex.cpp
 bool erase_from_butex_because_of_interruption(ButexWaiter* bw);
 
-static int interrupt_and_consume_waiters(
-    bthread_t tid, ButexWaiter** pw, uint64_t* sleep_id) {
+static int interrupt_and_consume_waiters(bthread_t tid, ButexWaiter** pw, uint64_t* sleep_id) {
     TaskMeta* const m = TaskGroup::address_meta(tid);
     if (m == NULL) {
         return EINVAL;

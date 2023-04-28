@@ -59,8 +59,50 @@ inline void TaskGroup::exchange(TaskGroup** pg, bthread_t next_tid) {
     TaskGroup::sched_to(pg, next_tid);
 }
 
+// 这段代码是 TaskGroup 类中的一个方法，用于将当前任务调度到另一个任务上。
+// 具体来说，这个方法会根据指定的任务 ID，找到该任务对应的 TaskMeta 对象，并为其分配一个栈空间，然后将当前任务切换到该任务上执行。
+//
+// 下面是具体操作：
+//  1. 通过地址计算获取到下一个任务的 TaskMeta 对象。
+//  2. 判断下一个任务是否已经有栈空间（即是否已经执行过），如果下一个任务没有栈空间，为其分配一个新的栈空间。
+//  3. 如果能够成功分配栈空间，就将该空间设置到 TaskMeta 的 stack 属性中；
+//     否则，则将任务的执行方式设为 “在 pthread 中直接运行” ，并将栈空间设置为 TaskGroup 对象的主栈空间。
+//  4. 调用 sched_to 方法，将当前任务切换到下一个任务上执行。
+//
+// 注意：
+// 在分配协程栈时，TaskMeta 对象的属性 stack_type 表示要使用的栈类型。
+// 如果 TaskMeta 对象对应的线程不能申请到 bthread 的栈，或者没有足够的内存可用，就会强制使用 pthread 栈。
+// 在这种情况下，任务将在 pthread 线程中执行，而不是在 bthread 协程中执行。
+//
+//
+//
+// 在 brpc 框架中，sched_to() 函数用于将当前任务挂起并切换到指定的任务进行执行。
+// sched_to() 函数在何时返回取决于以下几个条件：
+//
+//  执行链中没有比指定任务优先级更高的任务。
+//  指定任务执行完毕，并且没有调用 yield_to() 或 sched_to() 等接口主动让出 CPU 。
+//  被指定任务后续执行的 await_xxx() 等函数中没有任何未完成的 I/O 操作（被调用方不再需要 I/O 操作）。
+//  通过 set_remained() 设置了 RemainedFn 函数，并保存了当前任务的状态信息。
+//      在下一次执行该任务时，如果使用相同的 RemainedFn 函数参数，则可以从保存的状态信息位置恢复当前任务的执行状态。
+//
+// 当上述条件满足时，sched_to() 函数会返回，并将控制权交给指定的任务执行，直到该任务运行结束或者通过 yield_to() 或 sched_to() 等函数主动让出 CPU 。
+//
+//
+// 在 brpc 框架中，sched_to 函数调用时会将当前协程状态保存后立即切换到目标协程执行。
+// 因此，sched_to 函数并不会在目标协程执行完成后返回。
+//
+// 实际上，当目标协程执行完成后，会通过 task_runner 函数调用回到对应的 TaskGroup 中。
+// 在 task_runner 函数中会进行协程的清理工作，并执行可能存在的后续任务。
+// 如果该 TaskGroup 中没有后续任务，则该 TaskGroup 将被释放，当前协程将继续执行。
+//
+// 因此，sched_to 函数返回的时机并不确定，取决于目标协程的执行情况以及后续任务的安排。
 inline void TaskGroup::sched_to(TaskGroup** pg, bthread_t next_tid) {
+
+    // 根据传入的 next_tid 取出对应 bthread 的 meta 信息
     TaskMeta* next_meta = address_meta(next_tid);
+
+    // 如果对应 meta 的 stack 为空，说明这是一个新建的 bthread，
+    // 调用 get_stack 从一个 object pool 类型的资源池里取出 stack 对象赋给 bthread，object pool 继承自 resource pool。
     if (next_meta->stack == NULL) {
         ContextualStack* stk = get_stack(next_meta->stack_type(), task_runner);
         if (stk) {
@@ -74,7 +116,9 @@ inline void TaskGroup::sched_to(TaskGroup** pg, bthread_t next_tid) {
             next_meta->set_stack((*pg)->_main_stack);
         }
     }
+
     // Update now_ns only when wait_task did yield.
+    // 确保 stack 就绪后再调用内部的 TaskGroup::sched_to 的重载函数去执行切换操作。
     sched_to(pg, next_meta);
 }
 

@@ -185,11 +185,16 @@ int bthread_start_urgent(bthread_t* __restrict tid,
                          const bthread_attr_t* __restrict attr,
                          void * (*fn)(void*),
                          void* __restrict arg) {
+
+    // 取本线程的 tg
     bthread::TaskGroup* g = bthread::tls_task_group;
+    // 如果不为 null，则表明当前就是 bthread 而且 tls_task_group 指明了对应的 TaskGroup，在对应 TaskGroup（worker）执行新 bthread 的启动即可。
     if (g) {
         // start from worker
         return bthread::TaskGroup::start_foreground(&g, tid, attr, fn, arg);
     }
+    // 如果为 null，说明当前线程不是 bthread，此时会调用 start_from_non_worker 函数。
+    // 该函数会调用 get_or_new_task_control 函数获取或者创建新的 TaskControl 单例。
     return bthread::start_from_non_worker(tid, attr, fn, arg);
 }
 
@@ -377,10 +382,13 @@ int bthread_timer_del(bthread_timer_t id) {
 }
 
 int bthread_usleep(uint64_t microseconds) {
-    bthread::TaskGroup* g = bthread::tls_task_group;
-    if (NULL != g && !g->is_current_pthread_task()) {
-        return bthread::TaskGroup::usleep(&g, microseconds);
+    // 取当前线程关联的 tg
+    bthread::TaskGroup* tg = bthread::tls_task_group;
+    // 如果非空且非 pthread 模式，就调用 usleep
+    if (NULL != tg && !tg->is_current_pthread_task()) {
+        return bthread::TaskGroup::usleep(&tg, microseconds);
     }
+    // 否则，调用 os usleep
     return ::usleep(microseconds);
 }
 

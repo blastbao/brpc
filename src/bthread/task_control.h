@@ -34,12 +34,6 @@
 #include "bthread/parking_lot.h"
 
 
-
-
-
-
-
-
 namespace bthread {
 
 class TaskGroup;
@@ -48,7 +42,7 @@ class TaskGroup;
 //
 // 一个 TaskGroup 对应一个 worker ，也即一个 pthread ，用于管理一组协程。所有的 TaskGroup 由一个 TaskControl 的单例控制。
 //
-// TaskMeta 保存的是一个协程的上下问，包括需要执行的函数，函数参数，堆栈内容，协程id，状态，还有和锁相关的内容，
+// TaskMeta 保存的是一个协程的上下问，包括需要执行的函数，函数参数，堆栈内容，协程id，状态，还有和锁相关的内容。
 class TaskControl {
     friend class TaskGroup;
 
@@ -123,6 +117,10 @@ private:
     bvar::PassiveStatus<std::string> _status;
     bvar::Adder<int64_t> _nbthreads;
 
+    // 一个 TC 有 4 个 PL 对象，因为全局只有一个 TC ，所以也就是全局只有 4 个 PL 。
+    // 这样，TC 下面的所有 TG（worker）被分成了 4 组，每组共享一个 PL 。
+    // 通过 PL 调控 TG 之间 bthread 任务的生产与消费。
+    // 之所以用 4 个 PL ，而不是一个 PL ，大概率也是为了减少 race condition（竞争状态）减少性能开销。
     static const int PARKING_LOT_NUM = 4;
     ParkingLot _pl[PARKING_LOT_NUM];
 };

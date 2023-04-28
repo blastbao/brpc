@@ -366,7 +366,6 @@ int TaskControl::_destroy_group(TaskGroup* g) {
 }
 
 
-
 bool TaskControl::steal_task(bthread_t* tid, size_t* seed, size_t offset) {
     // 1: Acquiring fence is paired with releasing fence in _add_group to
     // avoid accessing uninitialized slot of _groups.
@@ -382,7 +381,10 @@ bool TaskControl::steal_task(bthread_t* tid, size_t* seed, size_t offset) {
         TaskGroup* g = _groups[s % ngroup];
         // g is possibly NULL because of concurrent _destroy_group
         if (g) {
-            //
+
+            // _rq 比 _remote_rq 有更高的优先级
+
+
             if (g->_rq.steal(tid)) { // 无锁窃取
                 stolen = true;
                 break;
@@ -403,6 +405,7 @@ void TaskControl::signal_task(int num_task) {
     if (num_task <= 0) {
         return;
     }
+
     // TODO(gejun): Current algorithm does not guarantee enough threads will
     // be created to match caller's requests. But in another side, there's also
     // many useless signalings according to current impl. Capping the concurrency
@@ -413,10 +416,14 @@ void TaskControl::signal_task(int num_task) {
         num_task = 2;
     }
 
-    // 通过 ParkingLog 唤醒
+    // [重要]
+    // 注意，传入的 num_task 含义是等待执行的协程数目，但是这里将其最大值限制为 2 ，此时它代表着将要唤醒的 pthread 数目。
+
+    // 先找到当前 pthread 所归属的 ParkingLog ，然后调用这个 PL 的成员函数 signal(1) 来唤醒其上的一个 pthread 。
     int start_index = butil::fmix64(pthread_numeric_id()) % PARKING_LOT_NUM;
-    num_task -= _pl[start_index].signal(1);
+    num_task -= _pl[start_index].signal(1); // 一次唤醒一个 pthread
     if (num_task > 0) {
+        // 继续唤醒下一个 pl 上的 pthread 。
         for (int i = 1; i < PARKING_LOT_NUM && num_task > 0; ++i) {
             if (++start_index >= PARKING_LOT_NUM) {
                 start_index = 0;
@@ -424,11 +431,12 @@ void TaskControl::signal_task(int num_task) {
             num_task -= _pl[start_index].signal(1);
         }
     }
+
+    // 如果任务较多执行不过来，且当前 pthread 都在运行，可能需要增加 pthread 。
     if (num_task > 0 &&
         FLAGS_bthread_min_concurrency > 0 &&    // test min_concurrency for performance
         _concurrency.load(butil::memory_order_relaxed) < FLAGS_bthread_concurrency) {
         // TODO: Reduce this lock
-        // 当仍然有需要执行的任务时，尝试增加工作线程
         BAIDU_SCOPED_LOCK(g_task_control_mutex);
         if (_concurrency.load(butil::memory_order_acquire) < FLAGS_bthread_concurrency) {
             add_workers(1);

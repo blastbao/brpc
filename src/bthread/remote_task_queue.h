@@ -25,6 +25,10 @@
 #include "butil/containers/bounded_queue.h"
 #include "butil/macros.h"
 
+
+// 在 brpc 中，每个工作线程维护一个 RemoteTaskQueue ，非工作线程没有自己的任务队列，因此非工作线程需要通过工作线程提交任务。
+// 由于非工作线程随机选择一个工作线程的 RemoteTaskQueue 提交任务，本身就降低了访问同一个 RemoteTaskQueue 的冲突，
+// 因此 RemoteTaskQueue 的实现比较简单，内置一把锁用于同步，支持 push 和 pop 两种操作。
 namespace bthread {
 
 class TaskGroup;
