@@ -33,6 +33,9 @@
 //  - stop 则是将停止的标识位置为 1，然后唤醒所有 wait 的线程，这里的 stop 指的就是 wait 的 stop
 //  - get_state 是获取用于 wait 的状态，就是直接返回 _pending_signal 的值
 
+// ParkingLot 的等待与唤醒都是利用系统调用 futex_wait 和 futex_wake 来实现。
+// futex 的优势在于 wait 时会先判断当前的 pending_signal 是否和 expected_state 的值相等，如果不相等则直接返回，不必进入内核态，减少开销。
+// 具体原理参考 futex — Linux manual page 。
 namespace bthread {
 
 // Park idle workers.

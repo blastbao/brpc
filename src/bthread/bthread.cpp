@@ -28,8 +28,6 @@
 #include "bthread/list_of_abafree_id.h"
 #include "bthread/bthread.h"
 
-
-
 // Q: 当前正在执行的 bthread 还没有执行完，会切换到下一个 bthread 上去吗？
 // A:
 //
@@ -40,11 +38,56 @@
 //  只有被挂起的时候才会切换，一般就是因为 IO 。
 //  比如在使用 brpc 的 channel 异步请求下游服务或 redis 的时候，在对方 response 返回之前，会切换 bthread 。
 //  正常的如果在执行串行的计算逻辑不会切 bthread 。
+
+// Q: 调用阻塞的 syscall 的时候，是怎么切换协程的呢?
+// A: 不切，当前线程会被阻塞住。这也是为什么 golang 的协程更完善，从语言层面解决系统调用造成的阻塞。
+
+//【Q1】如果在 callback 里阻塞整个 worker ，其他 worker 会偷过来运行，但是万一所有worker都被阻塞住，那就gg了。
+//【Q2】如果在 callback 里发起 brpc ，只会阻塞当前 bthread ，底层的 worker 不受影响，他发现后就移出 rq ，
+//  这时，这个 callback 可能一会儿在 worker1 里跑、一会儿在 worker2 里跑，所以如果用了 pthread 级别的变量，就会有逻辑错误。
+//  在 bthread 中，尽量不要使用 pthread loca l数据，如果一定要使用，需要通过 pthread_key_create 和 pthread_getspecific（mempool.h）。
+//【Q3】如果在 callback 里加锁后发起下游 rpc 请求，那么情况是线程 1 抢到 butex 发起 rpc 请求，它需要等 brpc 返回后才能解锁，
+//  但是处理请求的返回是需要资源的，若资源都被占了就会死锁。
+
+// 1、bthread 为啥会设计 rq、remote_rq 两个队列，一个不可以吗？
+//  如果只有一个，非 worker 添加的 bthread 也要入 rq ，那么就变成多生产者了，当前的 WorkStealingQueue 是无法满足的，如果要支持多生产者势必会增加开销。
 //
+//  为什么 bthread 会设计这两个队列呢？主要原因有以下几点：
+//  - 避免锁竞争
+//      在并发编程中，锁竞争是一个普遍存在的问题，而锁的竞争会严重影响程序的性能。
+//      由于 rq 队列只存储本地协程，所以在调度器内部对它进行操作时，并不需要获得任何锁。
+//      而当需要从其它线程中传送协程时，bthread 就会将这些协程放入 remote_rq 中，然后唤醒调度器中的一个线程去处理这些协程。
+//      这样做的好处是，在处理远程协程的时候，可以避免与本地协程对 rq 队列的访问产生竞争。
+//
+//  - 减少上下文切换
+//      上下文切换是协程调度器必须要面对的一个问题。
+//      如果在 rq 队列中既存储本地协程，又存储远程协程，那么当调度器在切换协程时，就需要遍历整个队列来找到下一个要执行的协程。
+//      这样做会导致上下文切换时间过长，影响程序的性能。
+//      如果将本地协程和远程协程分开存储，在调度器切换协程时就可以避免对远程协程的遍历，从而减少上下文切换的时间。
+//
+//  - 方便远程协程的管理
+//      将本地协程和远程协程分开存储，也方便了对远程协程的管理。
+//      bthread 中提供了一套完整的接口，用于传送、暂停、恢复和取消远程协程。
+//      这些接口都是针对 remote_rq 队列中的协程设计的，所以使用起来更加方便和高效。
+//
+//  综上所述，bthread 之所以设计 rq 和 remote_rq 两个队列，是为了避免锁竞争、减少上下文切换和方便远程协程的管理。
+//  这样做的好处是显而易见的，可以提高程序的性能和可维护性。
+//
+//
+// 2、为啥 wait_task 唤醒后，要先去 remote_rq 里取 tid 执行呢，而不先从 rq 里取？
+//  全局的 steal 优先 steal rq ，如果本地唤醒后不优先去 _remote_rq 里取的话 remote task 可能会长时间得不到调度。
+//
+// 3、bthread 在执行过程中需要创建另一个 bthread 时，会调用 TaskGroup::start_foreground() ，在 start_foreground() 内完成 bthread 2 的 TaskMeta 对象的创建，
+// 并调用 sched_to() 让 worker 去执行 bthread 2 的任务函数，worker 在真正执行 bthread 2 的任务函数前会将 bthread 1 的 tid 重新压入 TaskGroup 的 rq 队尾，
+// bthread 1 不久之后会再次被调度执行，但不一定在此 worker 内了。
 
 
-
-
+// bthread 执行用户指定的 func 过程中，有以下两种情况：
+//
+//  - func 执行完毕：
+//      此时，先去当前在跑的 TaskGroup 中的 _rq 中看是否有其他 bth ，如果有直接执行下一个，如果没有就去偷，偷不到最后会返回 phtread 的调度 bth ，也就是卡在 wait_task 处；
+//  - func 中创建新 bth 或调用阻塞操作：
+//      立即进入新 bth ，原 bth 加入 _rq 尾部（这个被迫中断的 bth 不久后会被运行，但不一定在原来的 pth 上执行，可能被偷）；
 
 namespace bthread {
 
@@ -88,6 +131,11 @@ inline TaskControl* get_task_control() {
     return g_task_control;
 }
 
+// 步骤:
+//  首先判断 g_task_control 是否在全局范围内已被创建，存在直接返回；
+//  加 pthread_mutex_t 类型锁，并且这里为了防止其他线程同时创建再次检测是否存在；
+//  创建全局 TaskControl，并传入指定的 concurrency（实际上是 pthread）的数量，默认为 9（8 + 1 个 epoll 线程）个；
+//  初始化 g_task_control 并返回。
 inline TaskControl* get_or_new_task_control() {
     // 1. 全局变量 TC（g_task_control）初始化，原子变量
     butil::atomic<TaskControl*>* p = (butil::atomic<TaskControl*>*)&g_task_control;
@@ -216,6 +264,16 @@ int bthread_start_urgent(bthread_t* __restrict tid,
     return bthread::start_from_non_worker(tid, attr, fn, arg);
 }
 
+// [重要]
+//
+// 如果创建这个 bthread 的调用者是外部的线程（非task_group），调用 start_from_non_worker 。
+// start_from_non_worker 的工作就是从 task_control 随机选择一个 task_group 作为这个新 bthread 的归宿。
+//
+// 如果创建者是已经存在于 task_group 的 bthread ，则会以当前的 task_group 作为最终归宿。
+//
+// task_group 中的 start_background 做的工作就是为新的 bthread 创建资源 TaskMeta ，然后情况将其加入不同的对列：
+//  - 情况 1 ：加入 remote_rq；
+//  - 情况 2 ：加入 _rq 。
 int bthread_start_background(bthread_t* __restrict tid,
                              const bthread_attr_t* __restrict attr,
                              void * (*fn)(void*),

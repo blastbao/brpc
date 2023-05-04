@@ -50,10 +50,14 @@ const static LocalStorage LOCAL_STORAGE_INIT = BTHREAD_LOCAL_STORAGE_INITIALIZER
 
 struct TaskMeta {
     // [Not Reset]
+    //
+    // 用于 Bthread 在 bmutex 挂起和唤醒。
+    // 比如在该执行体调用 brpc 的接口发送 rpc 请求的时候、使用 mutex 实现同步的时候，为了防止阻塞 pthread ，通过这个 item 将执行体挂起。
     butil::atomic<ButexWaiter*> current_waiter;
     uint64_t current_sleep;
 
     // A builtin flag to mark if the thread is stopping.
+    // 表示该 bthread 退出
     bool stop;
 
     // The thread is interrupted and should wake up from some blocking ops.
@@ -73,16 +77,21 @@ struct TaskMeta {
     bthread_t tid;
 
     // User function and argument
+    //
+    // bthread 调用的函数 fn 和对应参数
     void* (*fn)(void*);
     void* arg;
 
     // Stack of this task.
+    // 保存对应的 stack 和 context 信息
     ContextualStack* stack;
 
     // Attributes creating this task
+    // 保存创建该 bthread 的 attr ，类比 pthread_attr
     bthread_attr_t attr;
     
     // Statistics
+    // task 执行统计信息，执行时间、执行时间、context-switch 次数
     int64_t cpuwide_start_ns;
     TaskStatistics stat;
 

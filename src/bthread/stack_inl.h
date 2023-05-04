@@ -128,6 +128,14 @@ inline void return_stack(ContextualStack* s) {
     }
 }
 
+// jump_stack 步骤：
+//  - 保存所有当前协程 callee-saved registers
+//  - 把 ra 设置成需要 jump 到的目标
+//  - 恢复所有新协程的 called-saved registers
+//
+// 注意，我们假设有多个 bthread , TaskGroup 的 worker 调用了 sched_to , 然后系统会挑选第一个 bthread 来执行。
+// 执行完了，又会回到这个调度点。同时，TaskGroup::sched_to 这个函数在返回后可能被不同的线程执行。
+
 inline void jump_stack(ContextualStack* from, ContextualStack* to) {
     // bthread_jump_fcontext 函数是由汇编实现的，通过操作寄存器完成线程切换。
     bthread_jump_fcontext(&from->context, to->context, 0/*not skip remained*/);

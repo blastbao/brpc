@@ -57,9 +57,15 @@ public:
     TaskGroup* create_group();
 
     // Steal a task from a "random" group.
+    //
+    // 遍历所有 worker 去偷，防止某一个 thread 在某一个 TaskGroup 一直得不到 run 的情况。
+    //
+    //
     bool steal_task(bthread_t* tid, size_t* seed, size_t offset);
 
     // Tell other groups that `n' tasks was just added to caller's runqueue
+    //
+    // 通知一部分 parkinglot 里的 worker 说有新 bthread 被创建出来啦，提醒 worker 去偷。
     void signal_task(int num_task);
 
     // Stop and join worker threads in TaskControl.

@@ -59,6 +59,13 @@ inline void TaskGroup::exchange(TaskGroup** pg, bthread_t next_tid) {
     TaskGroup::sched_to(pg, next_tid);
 }
 
+
+
+
+// sched_to(tid) 中首先通过 tid 拿到该 tid 对应的 TaskMeta ，TaskMeta 为一个 bthread 的 meta 信息，如执行函数、参数、local storage 等；
+// 如果已经为该 meta 分配过栈，则调用 sched_to(next_meta)，该函数的主要逻辑为通过 jump_stack(cur_meta->stack, next_meta->stack) 跳转至next_meta；
+// 否则需分配栈，并设置该栈的执行入口为 task_runner 函数，然后就切过去开始执行 task_runner 函数。
+
 // 这段代码是 TaskGroup 类中的一个方法，用于将当前任务调度到另一个任务上。
 // 具体来说，这个方法会根据指定的任务 ID，找到该任务对应的 TaskMeta 对象，并为其分配一个栈空间，然后将当前任务切换到该任务上执行。
 //
@@ -74,13 +81,9 @@ inline void TaskGroup::exchange(TaskGroup** pg, bthread_t next_tid) {
 // 如果 TaskMeta 对象对应的线程不能申请到 bthread 的栈，或者没有足够的内存可用，就会强制使用 pthread 栈。
 // 在这种情况下，任务将在 pthread 线程中执行，而不是在 bthread 协程中执行。
 //
-// 在 brpc 框架中，sched_to 函数调用时会将当前协程状态保存后立即切换到目标协程执行。因此，sched_to 函数并不会在目标协程执行完成后返回。
-//
-// 实际上，当目标协程执行完成后，会通过 task_runner 函数调用回到对应的 TaskGroup 中。
-// 在 task_runner 函数中会进行协程的清理工作，并执行可能存在的后续任务。
-// 如果该 TaskGroup 中没有后续任务，则该 TaskGroup 将被释放，当前协程将继续执行。
-//
-// 因此，sched_to 函数返回的时机并不确定，取决于目标协程的执行情况以及后续任务的安排。
+// 在 brpc 框架中，sched_to 函数调用时会将当前协程状态保存后立即切换到目标协程执行。
+// 因此，sched_to 函数并不会在目标协程执行完成后返回。
+// 因为调度的不确定，sched_to 函数返回的时机并不确定，取决于目标协程的执行情况以及后续任务的安排。
 inline void TaskGroup::sched_to(TaskGroup** pg, bthread_t next_tid) {
 
     // 根据传入的 next_tid 取出对应 bthread 的 meta 信息

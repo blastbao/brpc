@@ -115,6 +115,7 @@ bool TaskGroup::is_stopped(bthread_t tid) {
     return true;
 }
 
+
 // 当前工作线程在窃取任务前会先取一次 ParkingLot 的状态，当状态发生改变时会直接跳过 wait 。
 bool TaskGroup::wait_task(bthread_t* tid) {
 
@@ -133,7 +134,6 @@ bool TaskGroup::wait_task(bthread_t* tid) {
         // 也就是说，如果自上次 steal_task() 执行之后，这个值没有变化，也就意味着过程中没有新增的协程，
         // 也就不需要马上再次执行 steal_task() ，而是进入阻塞状态，等待被新增协程的事件唤醒。
         _pl->wait(_last_pl_state);
-
 
         // 被唤醒后，意味着可能有新增协程等待执行，尝试执行 steal_task() 来获取。
         //
@@ -169,6 +169,20 @@ static double get_cumulated_cputime_from_this(void* arg) {
 //  1. wait_task()：获取有效任务（涉及工作窃取），出参 tid 会记录这个任务的 ID 号；
 //  2. sched_to()：进行栈、寄存器等运行时上下文的切换，为接下来运行的 tid 任务准备上下文。
 //  3. task_runner()：执行任务。
+//
+
+// [重要]
+//
+// 在拿到 tid 后，进入 TaskGroup::sched_to 去切栈，具体栈跳跃步骤为：
+//  1、调用 jump_stack 进入新的 bthread 栈，由于这时新的 bthread 还没有分配栈，会首先为它创建一个栈 new_stack ；
+//  2、新的 bthread 创建完后，利用 bthread_jump_fcontext 修改栈顶指针、各寄存器进入新栈 new_stack ，并记录跳转前的旧栈 stack_main 的相关内容；
+//  3、新栈的执行函数 fn 为 TaskGroup::task_runner（注意这个就是用户的 func ，层层函数指针传入），这个 task_runner 主要会干 3 个事儿：
+//      - 执行用户实际的回调函数 func（用户想让 bthread 干的事）；
+//      - 唤起等待该任务函数执行结束的 pthread/bthread；
+//      - ending_sched：
+//          尝试再 pop 出一个 bthread 来，如果现在没有新的 bthread，就把 _main_meta 作为下一次的跳转对象（相当于返回去继续执行原来的代码），
+//          再次调用 jump_stack 由 new_stack 跳转入 stack_main ，相当于又拿到了一个 tid 继续运行。
+//  4、都运行完了继续下一次 wait_task 的 do while 循环，重新阻塞在 _pl->wait() 上。
 void TaskGroup::run_main_task() {
     bvar::PassiveStatus<double> cumulated_cputime(get_cumulated_cputime_from_this, this);
     std::unique_ptr<bvar::PerSecond<bvar::PassiveStatus<double> > > usage_bvar;
@@ -285,11 +299,12 @@ int TaskGroup::init(size_t runqueue_capacity) {
     return 0;
 }
 
+// [重要]
 // 常见的协程调度策略：
 //  - 星切：主线程 --> 协程1 --> 主线程 --> 协程2 --> ... -->主线程
 //  - 环切：主线程 --> 协程1 --> 协程2 --> 协程3 --> ... -->主线程
-// 可以看出，环切比星切少了一半的切换次数，效率更高。
-// bthread 采用的是环切。
+// 可以看出，环切比星切少了一半的切换次数，效率更高；bthread 采用的是环切。
+
 
 //  虽然调用 bthread_start_* 创建新的 bthread 传入了上下文函数及其参数，但是 bthread 上不是直接运行该上下文函数，
 //  实际上运行的是 TaskGroup::task_runner 函数，步骤：
@@ -319,18 +334,32 @@ int TaskGroup::init(size_t runqueue_capacity) {
 //      最后，会将当前任务组对象 g 返回到其父级任务组中。
 //  循环执行到任务队列中的下一个任务的 tid 等于 g->_main_tid 时，循环结束。
 
-// bthread 工作线程在执行过程中会有以下几种状态：
-//  执行主协程任务，负责获取任务或者挂起等待，此时：
-//      _cur_meta->tid == _main_tid
-//      _cur_meta->stack == _main_stack
-//  执行 pthread 任务，直接在主协程中调用 TaskGroup::task_runner(1) 执行，此时：
-//      _cur_meta->tid != _main_tid
-//      _cur_meta->stack == _main_stack
-//  执行 bthread 任务，通过在 TaskGroup::sched_to 中调用 jump_stack 切换到协程栈，此时：
-//      _cur_meta->tid != _main_tid
-//      _cur_meta->stack != _main_stack
+// 步骤:
+//  找出本次循环中的 TaskMeta* m（const），即 bthread 上下文对象；
+//  执行 m 的回调函数 fn(arg)；
+//  局部变量（TLS variables）置空，详见原注释；
+//  更新版本号，不能为 0；
+//  唤醒所有在 butex 上等待的 bthreads；
+//  _nbthreads - 1，此变量类型为 bvar::Adder<int64_t>，在启动 bthread 任务的 start_foreground() 以及 start_background() 中已经完成了 + 1；
+//  ending_sched(&g) 查找下一个任务，并切换到其上下文。在此函数中：
+//  先从本 TaskGroup 的 _rq 中获取任务；
+//  再重复 steal_task() 的逻辑，即：本 _remote_rq，其他 TaskGroup 的 _rq，其他 TaskGroup 的 _remote_rq。
 //
-// 上述三种状态可以相互切换。
+// 以上任务全部完成则回到 run_main_task() 主循环等待新一轮任务。
+
+// 这个函数是整个 bthread 调度的核心，我们理一下：
+//  拿到现有 TaskGroup ，即现有 worker
+//  执行 _last_context_remained，清理掉 TaskGroup 上一次执行对应的资源
+//  在循环中，拿到 bthread 栈对应的 meta，这是需要执行的对象
+//  运行 m->fn()，这里是真正的逻辑
+//  需要注意的是，m->fn() 运行的时候，可能发生上下文切换，比如 m->fn() 里面调用了 bthread_usleep.
+//  清理上下文
+//  调用 ending_sched
+
+// task_runner 首先执行remain函数，remain 为一个 bthread 在开始运行自己逻辑前需要做的一些工作，后面会看到；
+// 然后执行该 meta 的函数，因为函数执行过程中该 bth 可能会调度至其他 worker ，因此 task_group 可能发生改变，所以重新对g进行设置；
+// 最后调用 ending_sched ，ending_sched 会尝试获取一个可执行的 bth ，如果没有的话，则下一个执行的则为 main_tid 对应的 meta ；
+// 然后通过上述的 sched_to(next_meta) 跳转到 next_meta 。
 
 void TaskGroup::task_runner(intptr_t skip_remained) {
 
@@ -546,11 +575,13 @@ int TaskGroup::start_background(bthread_t* __restrict th,
         LOG(INFO) << "Started bthread " << m->tid;
     }
     _control->_nbthreads << 1;
+
     if (REMOTE) {
         ready_to_run_remote(m->tid, (using_attr.flags & BTHREAD_NOSIGNAL));
     } else {
         ready_to_run(m->tid, (using_attr.flags & BTHREAD_NOSIGNAL));
     }
+
     return 0;
 }
 
@@ -734,14 +765,13 @@ void TaskGroup::sched_to(TaskGroup** pg, TaskMeta* next_meta) {
                 // jump_stack 是一段汇编代码，主要作用是栈和寄存器切换
                 jump_stack(cur_meta->stack, next_meta->stack);
 
-
                 /// [重要]
                 /// ... 重新调度，从这里继续执行
 
-
                 // probably went to another group, need to assign g again.
                 //
-                // 因为 work stealing 的存在，任务可能被换到其他线程了，worker 会变化，这里重置。
+                // 如果因为本协程迟迟未被运行而被其它 worker steal 了，都会导致返回后不处于同一线程中。
+                // 所以，这里要重置 worker 。
                 g = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
             }
 #ifndef NDEBUG
@@ -796,6 +826,7 @@ void TaskGroup::destroy_self() {
 }
 
 void TaskGroup::ready_to_run(bthread_t tid, bool nosignal) {
+    //
     push_rq(tid);
     if (nosignal) {
         ++_num_nosignal; // 对于设定了不触发信号的任务，仅增加计数
@@ -823,8 +854,6 @@ void TaskGroup::flush_nosignal_tasks() {
 // 如果 nosignal 设置为 true ，表示当前线程不需要接收信号，否则会给其它线程发送信号。
 void TaskGroup::ready_to_run_remote(bthread_t tid, bool nosignal) {
     _remote_rq._mutex.lock();
-
-
 
     // [重要]
     //

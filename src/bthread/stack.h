@@ -90,8 +90,12 @@ struct ContextualStack {
 ContextualStack* get_stack(StackType type, void (*entry)(intptr_t));
 // Recycle a stack. NULL does nothing.
 void return_stack(ContextualStack*);
+
 // Jump from stack `from' to stack `to'. `from' must be the stack of callsite
 // (to save contexts before jumping)
+//
+//
+//
 void jump_stack(ContextualStack* from, ContextualStack* to);
 
 }  // namespace bthread
