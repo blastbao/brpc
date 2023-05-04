@@ -41,7 +41,6 @@ class RemoteTaskQueue {
 public:
     RemoteTaskQueue() {}
 
-
     // 由于 BoundedQueue 构造函数并不能很好的处理 malloc 失败的情况，
     // 所以这里是在外部用 malloc 一段内存，然后再传给 BoundedQueue 来管理（所有权是：OWNS_STORAGE）。
     int init(size_t cap) {

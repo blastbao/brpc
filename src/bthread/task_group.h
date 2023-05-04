@@ -245,9 +245,6 @@ friend class TaskControl;
     //  如果一个 worker 内有一些 pthread 级别的阻塞，相当于这个 worker 就被阻塞了，那么其他 worker 会偷走该 worker 内被阻塞的 bthread ，
     //  保证整个系统可以顺利地跑在多核上。
 
-
-
-
     // 获取就绪协程
     //
     // 消费队列的优先级：

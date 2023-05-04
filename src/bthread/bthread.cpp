@@ -28,6 +28,14 @@
 #include "bthread/list_of_abafree_id.h"
 #include "bthread/bthread.h"
 
+
+// Q: brpc 中，为什么在sched_to中，不能直接覆盖协程的栈，而在 ending sched 中却可以直接覆盖？
+// A:
+//  在brpc中，sched_to()和ending_sched()都是调度协程的函数，但它们所处的时机不同。
+//  在sched_to()中，当前协程正在运行，调用sched_to()会将当前协程挂起，并切换到另一个协程。因此，在sched_to()中覆盖协程栈是不安全的，因为被覆盖的栈上可能保存有关键信息。
+//  而在ending_sched()中，当前协程已经完成了任务并结束了，这时候覆盖协程栈不会影响其他任务，因此是安全的。
+//  总之，如果覆盖协程栈可能会影响其他任务，则应该避免在sched_to()中覆盖栈。
+
 // Q: 当前正在执行的 bthread 还没有执行完，会切换到下一个 bthread 上去吗？
 // A:
 //
@@ -424,21 +432,24 @@ int bthread_about_to_quit() {
     return EPERM;
 }
 
-int bthread_timer_add(bthread_timer_t* id, timespec abstime,
-                      void (*on_timer)(void*), void* arg) {
+int bthread_timer_add(bthread_timer_t* id, timespec abstime, void (*on_timer)(void*), void* arg) {
+    // ???
     bthread::TaskControl* c = bthread::get_or_new_task_control();
     if (c == NULL) {
         return ENOMEM;
     }
+
     bthread::TimerThread* tt = bthread::get_or_create_global_timer_thread();
     if (tt == NULL) {
         return ENOMEM;
     }
+
     bthread_timer_t tmp = tt->schedule(on_timer, arg, abstime);
     if (tmp != 0) {
         *id = tmp;
         return 0;
     }
+
     return ESTOP;
 }
 

@@ -30,3 +30,7 @@
 #include "bvar/mvariable.h"
 
 #endif  //BVAR_BVAR_H
+
+
+// bvar 最核心的思想就是利用 thread local 变量来减少 cache bouncing ，本质上是将写的竞争转移到了读，
+// 但在诸如监控这种场景下，通常读是远远小于写的，因此这种转移的正向效果是显著的。

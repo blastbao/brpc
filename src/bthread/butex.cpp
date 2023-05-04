@@ -366,6 +366,7 @@ int butex_wake_all(void* arg, bool nosignal) {
 }
 
 int butex_wake_except(void* arg, bthread_t excluded_bthread) {
+
     Butex* b = container_of(static_cast<butil::atomic<int>*>(arg), Butex, value);
 
     ButexWaiterList bthread_waiters;
@@ -407,15 +408,13 @@ int butex_wake_except(void* arg, bthread_t excluded_bthread) {
     if (bthread_waiters.empty()) {
         return nwakeup;
     }
-    ButexBthreadWaiter* front = static_cast<ButexBthreadWaiter*>(
-                bthread_waiters.head()->value());
+    ButexBthreadWaiter* front = static_cast<ButexBthreadWaiter*>(bthread_waiters.head()->value());
 
     TaskGroup* g = get_task_group(front->control);
     const int saved_nwakeup = nwakeup;
     do {
         // pop reversely
-        ButexBthreadWaiter* w = static_cast<ButexBthreadWaiter*>(
-            bthread_waiters.tail()->value());
+        ButexBthreadWaiter* w = static_cast<ButexBthreadWaiter*>(bthread_waiters.tail()->value());
         w->RemoveFromList();
         unsleep_if_necessary(w, get_global_timer_thread());
         g->ready_to_run_general(w->tid, true);

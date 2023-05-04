@@ -27,6 +27,16 @@
 #include "butil/time.h"                // time utilities
 #include "bthread/mutex.h"
 
+
+// 定时器方案：
+//  1、使用 create_timer 创建定时器。问题是需要自己写 signal 处理函数。
+//  2、使用 fd 方式触发的 timer 。问题是不了解多线程环境下的效果。
+//
+// brpc 中 TimerThread 的核心设计思路：
+//  1、通过把 Task 分拆到不同的桶里面，避免对全局锁的激烈的竞争。
+//  2、利用全局小根堆存储所有未处理 Task 。
+
+
 namespace bthread {
 
 struct TimerThreadOptions {
@@ -64,13 +74,17 @@ public:
     // Start the timer thread.
     // This method should only be called once.
     // return 0 if success, errno otherwise.
+    // 启动
     int start(const TimerThreadOptions* options);
 
     // Stop the timer thread. Later schedule() will return INVALID_TASK_ID.
+    // 停止
     void stop_and_join();
 
     // Schedule |fn(arg)| to run at realtime |abstime| approximately.
     // Returns: identifier of the scheduled task, INVALID_TASK_ID on error.
+    //
+    // 将 fn, arg, asbtime 封装成定时器事件 push 到对应的 bucket
     TaskId schedule(void (*fn)(void*), void* arg, const timespec& abstime);
 
     // Prevent the task denoted by `task_id' from running. `task_id' must be
@@ -87,6 +101,7 @@ public:
     
 private:
     // the timer thread will run this method.
+    // 线程主函数
     void run();
     static void* run_this(void* arg);
 
@@ -94,12 +109,19 @@ private:
     butil::atomic<bool> _stop;
 
     TimerThreadOptions _options;
+
+    // 当前定时器所有的 buckets
     Bucket* _buckets;        // list of tasks to be run
     internal::FastPthreadMutex _mutex;    // protect _nearest_run_time
+    // 当前定时器中最近的需要被调度的事件时间点
     int64_t _nearest_run_time;
+
     // the futex for wake up timer thread. can't use _nearest_run_time because
     // it's 64-bit.
+    // 用于触发 condition variable 等待的信号
     int _nsignals;
+
+    // 线程 ID
     pthread_t _thread;       // all scheduled task will be run on this thread
 };
 

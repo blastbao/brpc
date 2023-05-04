@@ -92,6 +92,7 @@ inline void TaskGroup::sched_to(TaskGroup** pg, bthread_t next_tid) {
     // 如果对应 meta 的 stack 为空，说明这是一个新建的 bthread，
     // 调用 get_stack 从一个 object pool 类型的资源池里取出 stack 对象赋给 bthread，object pool 继承自 resource pool。
     if (next_meta->stack == NULL) {
+        // 把 task_runner 作为 bthread 栈的初始函数，第一次 jump 到一个 bthread 的时候，就进入此函数。
         ContextualStack* stk = get_stack(next_meta->stack_type(), task_runner);
         if (stk) {
             next_meta->set_stack(stk);
@@ -110,6 +111,8 @@ inline void TaskGroup::sched_to(TaskGroup** pg, bthread_t next_tid) {
     sched_to(pg, next_meta);
 }
 
+
+// 尝试 push 到 rq 中, 如果队列满了, 说明创建了太多任务, 会需要 sleep 一下。
 inline void TaskGroup::push_rq(bthread_t tid) {
     while (!_rq.push(tid)) {
         // Created too many bthreads: a promising approach is to insert the

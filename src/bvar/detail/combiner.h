@@ -109,8 +109,7 @@ private:
 };
 
 template <typename T>
-class ElementContainer<
-    T, typename butil::enable_if<is_atomical<T>::value>::type> {
+class ElementContainer<T, typename butil::enable_if<is_atomical<T>::value>::type> {
 public:
     // We don't need any memory fencing here, every op is relaxed.
     
@@ -128,8 +127,7 @@ public:
 
     // [Unique]
     inline bool compare_exchange_weak(T& expected, T new_value) {
-        return _value.compare_exchange_weak(expected, new_value,
-                                            butil::memory_order_relaxed);
+        return _value.compare_exchange_weak(expected, new_value,butil::memory_order_relaxed);
     }
 
     template <typename Op, typename T1>
@@ -141,8 +139,7 @@ public:
         // if the tls value has been modified during _op, the
         // compare_exchange_weak operation will fail and recalculation is
         // to be processed according to the new version of value
-        while (!_value.compare_exchange_weak(
-                   old_value, new_value, butil::memory_order_relaxed)) {
+        while (!_value.compare_exchange_weak(old_value, new_value, butil::memory_order_relaxed)) {
             new_value = old_value;
             call_op_returning_void(op, new_value, value2);
         }
@@ -152,14 +149,20 @@ private:
     butil::atomic<T> _value;
 };
 
+
+
+// AgentCombiner 将一个 bvar 在各个线程中的 tls 统计值汇总起来。
 template <typename ResultTp, typename ElementTp, typename BinaryOp>
 class AgentCombiner {
 public:
+
     typedef ResultTp result_type;
     typedef ElementTp element_type;
     typedef AgentCombiner<ResultTp, ElementTp, BinaryOp> self_type;
-friend class GlobalValue<self_type>;
-    
+
+    friend class GlobalValue<self_type>;
+
+    //
     struct Agent : public butil::LinkNode<Agent> {
         Agent() : combiner(NULL) {}
 
@@ -266,9 +269,11 @@ friend class GlobalValue<self_type>;
 
     // Always called from the thread owning the agent.
     void commit_and_erase(Agent *agent) {
+
         if (NULL == agent) {
             return;
         }
+
         ElementTp local;
         butil::AutoLock guard(_lock);
         // TODO: For non-atomic types, we can pass the reference to op directly.
@@ -277,6 +282,7 @@ friend class GlobalValue<self_type>;
         call_op_returning_void(_op, _global_result, local);
         agent->RemoveFromList();
     }
+
 
     // Always called from the thread owning the agent
     void commit_and_clear(Agent *agent) {
@@ -291,6 +297,7 @@ friend class GlobalValue<self_type>;
 
     // We need this function to be as fast as possible.
     inline Agent* get_or_create_tls_agent() {
+        // 根据 id 获取 agent ，不存在则新建
         Agent* agent = AgentGroup::get_tls_agent(_id);
         if (!agent) {
             // Create the agent
@@ -300,15 +307,19 @@ friend class GlobalValue<self_type>;
                 return NULL;
             }
         }
+
         if (agent->combiner) {
             return agent;
         }
+
         agent->reset(_element_identity, this);
+
         // TODO: Is uniqueness-checking necessary here?
         {
             butil::AutoLock guard(_lock);
             _agents.Append(agent);
         }
+
         return agent;
     }
 

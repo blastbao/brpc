@@ -87,6 +87,12 @@ struct SeriesOptions {
     bool test_only;
 };
 
+
+// Variable 是所有 bvar 的基类，主要提供全局注册、列举、查询等功能。
+// 建立一个 bvar 时如果没指定 name ，这个 bvar 并未注册到任何全局结构中，在这种情况下，bvar 纯粹是一个更快的计数器。
+// 把一个 bvar 注册到全局表中的行为为“曝光”，两种方式可以曝光，一种是创建 bvar 时指定 name 则在创建的同时调用了曝光函数，
+// 第二种可调用 bvar 的 expose 相关函数曝光。
+
 // Base class of all bvar.
 //
 // About thread-safety:
@@ -130,8 +136,7 @@ public:
     //   describe_exposed
     //   find_exposed
     // Return 0 on success, -1 otherwise.
-    int expose(const butil::StringPiece& name,
-               DisplayFilter display_filter = DISPLAY_ON_ALL) {
+    int expose(const butil::StringPiece& name, DisplayFilter display_filter = DISPLAY_ON_ALL) {
         return expose_impl(butil::StringPiece(), name, display_filter);
     }
  

@@ -359,9 +359,12 @@ int TaskControl::_destroy_group(TaskGroup* g) {
     // FLAGS_task_group_delete_delay seconds
     if (erased) {
         get_global_timer_thread()->schedule(
-            delete_task_group, g,
-            butil::microseconds_from_now(FLAGS_task_group_delete_delay * 1000000L));
+            delete_task_group,
+            g,
+            butil::microseconds_from_now(FLAGS_task_group_delete_delay * 1000000L)
+        );
     }
+
     return 0;
 }
 
@@ -383,8 +386,6 @@ bool TaskControl::steal_task(bthread_t* tid, size_t* seed, size_t offset) {
         if (g) {
 
             // _rq 比 _remote_rq 有更高的优先级
-
-
             if (g->_rq.steal(tid)) { // 无锁窃取
                 stolen = true;
                 break;

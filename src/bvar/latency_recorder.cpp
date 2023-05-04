@@ -53,8 +53,7 @@ void CDF::describe(std::ostream& os, bool) const {
     os << "\"click to view\"";
 }
 
-int CDF::describe_series(
-    std::ostream& os, const SeriesOptions& options) const {
+int CDF::describe_series(std::ostream& os, const SeriesOptions& options) const {
     if (_w == NULL) {
         return 1;
     }
@@ -123,8 +122,7 @@ static CombinedPercentileSamples* combine(PercentileWindow* w) {
 
 template <int64_t numerator, int64_t denominator>
 static int64_t get_percetile(void* arg) {
-    return ((LatencyRecorder*)arg)->latency_percentile(
-            (double)numerator / double(denominator));
+    return ((LatencyRecorder*)arg)->latency_percentile((double)numerator / double(denominator));
 }
 
 static int64_t get_p1(void* arg) {
@@ -141,8 +139,7 @@ static int64_t get_p3(void* arg) {
 }
 
 static Vector<int64_t, 4> get_latencies(void *arg) {
-    std::unique_ptr<CombinedPercentileSamples> cb(
-        combine((PercentileWindow*)arg));
+    std::unique_ptr<CombinedPercentileSamples> cb(combine((PercentileWindow*)arg));
     // NOTE: We don't show 99.99% since it's often significantly larger than
     // other values and make other curves on the plotted graph small and
     // hard to read.
@@ -188,12 +185,15 @@ int64_t LatencyRecorder::qps(time_t window_size) const {
     return detail::double_to_random_int(s.data.num * 1000000.0 / s.time_us);
 }
 
-int LatencyRecorder::expose(const butil::StringPiece& prefix1,
-                            const butil::StringPiece& prefix2) {
+int LatencyRecorder::expose(const butil::StringPiece& prefix1, const butil::StringPiece& prefix2) {
+
+    // 前缀非空
     if (prefix2.empty()) {
         LOG(ERROR) << "Parameter[prefix2] is empty";
         return -1;
     }
+
+    // 去除 "latency" 后缀
     butil::StringPiece prefix = prefix2;
     // User may add "_latency" as the suffix, remove it.
     if (prefix.ends_with("latency") || prefix.ends_with("Latency")) {
@@ -203,6 +203,8 @@ int LatencyRecorder::expose(const butil::StringPiece& prefix1,
             return -1;
         }
     }
+
+    // 合并 prefix1 和 prefix2 ，用 "_" 连接
     std::string tmp;
     if (!prefix1.empty()) {
         tmp.reserve(prefix1.size() + prefix.size() + 1);
@@ -253,6 +255,7 @@ int LatencyRecorder::expose(const butil::StringPiece& prefix1,
     if (_latency_percentiles.expose_as(prefix, "latency_percentiles", DISPLAY_ON_HTML) != 0) {
         return -1;
     }
+
     snprintf(namebuf, sizeof(namebuf), "%d%%,%d%%,%d%%,99.9%%",
              (int)FLAGS_bvar_latency_p1, (int)FLAGS_bvar_latency_p2,
              (int)FLAGS_bvar_latency_p3);
@@ -261,8 +264,7 @@ int LatencyRecorder::expose(const butil::StringPiece& prefix1,
 }
 
 int64_t LatencyRecorder::latency_percentile(double ratio) const {
-    std::unique_ptr<detail::CombinedPercentileSamples> cb(
-        combine((detail::PercentileWindow*)&_latency_percentile_window));
+    std::unique_ptr<detail::CombinedPercentileSamples> cb(combine((detail::PercentileWindow*)&_latency_percentile_window));
     return cb->get_number(ratio);
 }
 

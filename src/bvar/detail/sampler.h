@@ -41,6 +41,11 @@ struct Sample {
     Sample(const T& data2, int64_t time2) : data(data2), time_us(time2) {}  
 };
 
+// 出于性能考虑，Window 的数据来自于每秒一次对原计数器的采样。
+//
+// SamplerCollector 是全局单例，它会创建一个线程：sampling_thread，这个线程会定时遍历所有加入到 SamplerCollector 的 Sampler ，调用 Sampler 的采样函数。
+// 普通 bvar 默认是不会创建 Sampler 的，只有在被 WindowBase 子类（例如 Window, PerSecond ）追踪时才会创建 Sampler 并加入到 SamplerCollector 。
+
 // The base class for all samplers whose take_sample() are called periodically.
 class Sampler : public butil::LinkNode<Sampler> {
 public:

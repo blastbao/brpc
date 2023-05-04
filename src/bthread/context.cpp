@@ -336,7 +336,6 @@ __asm (
 
 #if defined(BTHREAD_CONTEXT_PLATFORM_linux_x86_64) && defined(BTHREAD_CONTEXT_COMPILER_gcc)
 
-
 // 首先，将当前协程的运行状态保存到当前协程的上下文中，并把目标协程的上下文加载进程序的栈空间中。
 // 接着，它会检查是否需要保存和加载浮点寄存器。
 // 最后，它会将当前协程的地址存储到指定的寄存器中，然后跳转到指定的协程开始执行。

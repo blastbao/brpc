@@ -84,16 +84,22 @@ public:
     
     // Schedule a task into this bucket.
     // Returns the TaskId and if it has the nearest run time.
-    ScheduleResult schedule(void (*fn)(void*), void* arg,
-                            const timespec& abstime);
+    //
+    // 外围 timerthread 会调用 bucket 的 schedule 将事件插入其链表；
+    // bucket 并不为定时事件排序，也没必要排序，所有的排序都是在 timerthread 的线程函数中统一进行堆排序。
+    ScheduleResult schedule(void (*fn)(void*), void* arg, const timespec& abstime);
 
     // Pull all scheduled tasks.
     // This function is called in timer thread.
+    //
+    // timerthread 的线程函数中会通过该函数获取当前 bucket 的所有事件。
     Task* consume_tasks();
 
 private:
     internal::FastPthreadMutex _mutex;
+    // 每个 bucket 记录自己当前所存储的所有定时事件中最近要执行的时间点
     int64_t _nearest_run_time;
+    // 事件链表
     Task* _task_head;
 };
 
@@ -183,14 +189,14 @@ TimerThread::Task* TimerThread::Bucket::consume_tasks() {
 }
 
 TimerThread::Bucket::ScheduleResult
-TimerThread::Bucket::schedule(void (*fn)(void*), void* arg,
-                              const timespec& abstime) {
+TimerThread::Bucket::schedule(void (*fn)(void*), void* arg, const timespec& abstime) {
     butil::ResourceId<Task> slot_id;
     Task* task = butil::get_resource<Task>(&slot_id);
     if (task == NULL) {
         ScheduleResult result = { INVALID_TASK_ID, false };
         return result;
     }
+
     task->next = NULL;
     task->fn = fn;
     task->arg = arg;
@@ -200,6 +206,7 @@ TimerThread::Bucket::schedule(void (*fn)(void*), void* arg,
         task->version.fetch_add(2, butil::memory_order_relaxed);
         version = 2;
     }
+
     const TaskId id = make_task_id(slot_id, version);
     task->task_id = id;
     bool earlier = false;
@@ -216,16 +223,14 @@ TimerThread::Bucket::schedule(void (*fn)(void*), void* arg,
     return result;
 }
 
-TimerThread::TaskId TimerThread::schedule(
-    void (*fn)(void*), void* arg, const timespec& abstime) {
+TimerThread::TaskId TimerThread::schedule(void (*fn)(void*), void* arg, const timespec& abstime) {
     if (_stop.load(butil::memory_order_relaxed) || !_started) {
         // Not add tasks when TimerThread is about to stop.
         return INVALID_TASK_ID;
     }
+
     // Hashing by pthread id is better for cache locality.
-    const Bucket::ScheduleResult result = 
-        _buckets[butil::fmix64(pthread_numeric_id()) % _options.num_buckets]
-        .schedule(fn, arg, abstime);
+    const Bucket::ScheduleResult result = _buckets[butil::fmix64(pthread_numeric_id()) % _options.num_buckets].schedule(fn, arg, abstime);
     if (result.earlier) {
         bool earlier = false;
         const int64_t run_time = butil::timespec_to_microseconds(abstime);
@@ -241,6 +246,7 @@ TimerThread::TaskId TimerThread::schedule(
             futex_wake_private(&_nsignals, 1);
         }
     }
+
     return result.task_id;
 }
 
@@ -312,6 +318,16 @@ static T deref_value(void* arg) {
     return *(T*)arg;
 }
 
+
+// 主要内容：
+//  - 用最小堆 tasks 存放未执行的 task
+//  - 从桶中找出未执行的 task 放到 tasks ，根据调度时间排序，默认是最大堆；
+//    但是 push_heap 入参 cmp 返回 true 表示元素 1 比元素 2 小，排在后面，所以 run_time 较小的会放到 tasks 靠前的位置，就是最小堆。
+//  - 将已调度的任务移出最小堆。
+//  - 如果 _nearest_run_time（当前任务最早时间）比第一个 task 时间还早，要重新拉取一次
+//  - 取出一个未调度的任务，调用 run_and_delete 方法
+//  - 下一个最早的未调度任务的 run_time 更新到 _nearest_run_time
+//  - 计算下次任务还有多久到来，就在 _nsignals 上 wait 多久（futex_wait_private），如果 schedule 又添加了新任务，可能新任务的时间更早，所以会唤醒一次。
 void TimerThread::run() {
     run_worker_startfn();
 #ifdef BAIDU_INTERNAL
@@ -322,6 +338,9 @@ void TimerThread::run() {
     BT_VLOG << "Started TimerThread=" << pthread_self();
 
     // min heap of tasks (ordered by run_time)
+    // 最小堆，根据调度时间排序
+    //
+    // vector 是存放事件的容器，使用 std::push/pop_heap 对其进行堆排序。
     std::vector<Task*> tasks;
     tasks.reserve(4096);
 
@@ -340,8 +359,9 @@ void TimerThread::run() {
         ntriggered_second.expose_as(_options.bvar_prefix, "triggered_second");
         busy_seconds_second.expose_as(_options.bvar_prefix, "usage");
     }
-    
-    while (!_stop.load(butil::memory_order_relaxed)) {
+
+
+    while (!_stop.load(butil::memory_order_relaxed)) { // 未停止
         // Clear _nearest_run_time before consuming tasks from buckets.
         // This helps us to be aware of earliest task of the new tasks before we
         // would run the consumed tasks.
@@ -351,6 +371,7 @@ void TimerThread::run() {
         }
         
         // Pull tasks from buckets.
+        // 从所有的 bucket 中取出定时事件，放到最小堆中。
         for (size_t i = 0; i < _options.num_buckets; ++i) {
             Bucket& bucket = _buckets[i];
             for (Task* p = bucket.consume_tasks(); p != nullptr; ++nscheduled) {
@@ -359,7 +380,9 @@ void TimerThread::run() {
                 Task* next_task = p->next;
 
                 if (!p->try_delete()) { // remove the task if it's unscheduled
+                    // 将定时事件 push 到容器
                     tasks.push_back(p);
+                    // 进行堆排序，排序依据 task_greater
                     std::push_heap(tasks.begin(), tasks.end(), task_greater);
                 }
                 p = next_task;
@@ -368,10 +391,13 @@ void TimerThread::run() {
 
         bool pull_again = false;
         while (!tasks.empty()) {
+            // 取堆顶事件（不弹出）
             Task* task1 = tasks[0];  // the about-to-run task
+            // 是否需要处理
             if (butil::gettimeofday_us() < task1->run_time) {  // not ready yet.
                 break;
             }
+
             // Each time before we run the earliest task (that we think), 
             // check the globally shared _nearest_run_time. If a task earlier
             // than task1 was scheduled during pulling from buckets, we'll
@@ -392,9 +418,13 @@ void TimerThread::run() {
             }
             std::pop_heap(tasks.begin(), tasks.end(), task_greater);
             tasks.pop_back();
+
+            // 执行堆顶的定时事件回调
             if (task1->run_and_delete()) {
                 ++ntriggered;
             }
+
+            // 继续处理下一个事件，所有的定时事件是串行执行...
         }
         if (pull_again) {
             BT_VLOG << "pull again, tasks=" << tasks.size();
@@ -426,10 +456,13 @@ void TimerThread::run() {
         timespec next_timeout = { 0, 0 };
         const int64_t now = butil::gettimeofday_us();
         if (next_run_time != std::numeric_limits<int64_t>::max()) {
+            // 计算需要等待的下一个最小时间点
             next_timeout = butil::microseconds_to_timespec(next_run_time - now);
             ptimeout = &next_timeout;
         }
+
         busy_seconds += (now - last_sleep_time) / 1000000.0;
+        // 条件变量等待一段时间
         futex_wait_private(&_nsignals, expected_nsignals, ptimeout);
         last_sleep_time = butil::gettimeofday_us();
     }
@@ -454,17 +487,22 @@ void TimerThread::stop_and_join() {
     }
 }
 
+// 确保只初始化一次
 static pthread_once_t g_timer_thread_once = PTHREAD_ONCE_INIT;
+// 定时器线程
 static TimerThread* g_timer_thread = NULL;
 static void init_global_timer_thread() {
+    // 新建定时器线程对象
     g_timer_thread = new (std::nothrow) TimerThread;
     if (g_timer_thread == NULL) {
         LOG(FATAL) << "Fail to new g_timer_thread";
         return;
     }
+    // 启动定时器线程
     TimerThreadOptions options;
     options.bvar_prefix = "bthread_timer";
     const int rc = g_timer_thread->start(&options);
+    // 失败处理
     if (rc != 0) {
         LOG(FATAL) << "Fail to start timer_thread, " << berror(rc);
         delete g_timer_thread;
@@ -472,8 +510,12 @@ static void init_global_timer_thread() {
         return;
     }
 }
+
+
 TimerThread* get_or_create_global_timer_thread() {
+    // 初始化
     pthread_once(&g_timer_thread_once, init_global_timer_thread);
+    // 返回
     return g_timer_thread;
 }
 TimerThread* get_global_timer_thread() {

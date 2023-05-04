@@ -65,16 +65,23 @@ namespace bvar {
 // my_type_sum << MyType(1) << MyType(2) << MyType(3);
 // LOG(INFO) << my_type_sum;  // "MyType{6}"
 
+
+// Reducer 是一个三个模板参数的模板类，分别是：
+//  - T ：数据类型
+//  - Op ：reduce 操作符
+//  - InvOp ：Op 的逆向操作符，默认是 VoidOp ，也就是没有逆向操作，InvOp 在定时采样的时候会用到。
 template <typename T, typename Op, typename InvOp = detail::VoidOp>
 class Reducer : public Variable {
 public:
+    // 注意这三个 typedef ，分别定义了 combiner、agent 和 sampler 的类型，和 Reducer 本身的模板参数强相关。
     typedef typename detail::AgentCombiner<T, T, Op> combiner_type;
     typedef typename combiner_type::Agent agent_type;
     typedef detail::ReducerSampler<Reducer, T, Op, InvOp> sampler_type;
+
+
     class SeriesSampler : public detail::Sampler {
     public:
-        SeriesSampler(Reducer* owner, const Op& op)
-            : _owner(owner), _series(op) {}
+        SeriesSampler(Reducer* owner, const Op& op): _owner(owner), _series(op) {}
         ~SeriesSampler() {}
         void take_sample() override { _series.append(_owner->get_value()); }
         void describe(std::ostream& os) { _series.describe(os, NULL); }
@@ -109,16 +116,23 @@ public:
 
     // Add a value.
     // Returns self reference for chaining.
+    //
+    // 写入
     Reducer& operator<<(typename butil::add_cr_non_integral<T>::type value);
 
     // Get reduced value.
     // Notice that this function walks through threads that ever add values
     // into this reducer. You should avoid calling it frequently.
+    //
+    // 读取
     T get_value() const {
+        // 如果当前 bvar 已被 window 跟踪定时采样而且不存在 invop ，比如 Maxer ，是不能调用这个函数的。
+        // 因为依赖 tls 的关系，对于这类没有 invop 的 reducer ，在定时采样（take_sample）的时候需要 reset agent ，调用这个函数取不到正确值。
         CHECK(!(butil::is_same<InvOp, detail::VoidOp>::value) || _sampler == NULL)
             << "You should not call Reducer<" << butil::class_name_str<T>()
             << ", " << butil::class_name_str<Op>() << ">::get_value() when a"
             << " Window<> is used because the operator does not have inverse.";
+        // 通过 combiner 聚合各个 agent 的值
         return _combiner.combine_agents();
     }
 
@@ -181,26 +195,39 @@ protected:
     }
 
 private:
+
     combiner_type   _combiner;
+
+    // 只有被 window 之类的追踪了才会去新建 sampler ，单纯的使用 reducer 不需要 sampler 。
+    // 因此，sampler 不是必须的，所以是指针。
     sampler_type* _sampler;
     SeriesSampler* _series_sampler;
     InvOp _inv_op;
 };
 
+
+// 写入
 template <typename T, typename Op, typename InvOp>
-inline Reducer<T, Op, InvOp>& Reducer<T, Op, InvOp>::operator<<(
-    typename butil::add_cr_non_integral<T>::type value) {
+inline Reducer<T, Op, InvOp>& Reducer<T, Op, InvOp>::operator<<(typename butil::add_cr_non_integral<T>::type value) {
     // It's wait-free for most time
+    // 首先调用拿到当前线程的 agent ，内部实现上就是tls的相关操作，如果还未分配则会新建 agent 。
     agent_type* agent = _combiner.get_or_create_tls_agent();
     if (__builtin_expect(!agent, 0)) {
         LOG(FATAL) << "Fail to create agent";
         return *this;
     }
+    // 用操作符 op 和值 value 进行修改操作。
     agent->element.modify(_combiner.op(), value);
     return *this;
 }
 
 // =================== Common reducers ===================
+
+
+
+
+
+
 
 // bvar::Adder<int> sum;
 // sum << 1 << 2 << 3 << 4;
@@ -209,34 +236,51 @@ inline Reducer<T, Op, InvOp>& Reducer<T, Op, InvOp>::operator<<(
 namespace detail {
 template <typename Tp>
 struct AddTo {
-    void operator()(Tp & lhs, 
-                    typename butil::add_cr_non_integral<Tp>::type rhs) const
+    void operator()(Tp & lhs, typename butil::add_cr_non_integral<Tp>::type rhs) const
     { lhs += rhs; }
 };
 template <typename Tp>
 struct MinusFrom {
-    void operator()(Tp & lhs, 
-                    typename butil::add_cr_non_integral<Tp>::type rhs) const
+    void operator()(Tp & lhs, typename butil::add_cr_non_integral<Tp>::type rhs) const
     { lhs -= rhs; }
 };
 }
+
+
+// 注意 Adder 继承的是 Reducer<T, detail::AddTo, detail::MinusFrom > ，也就是加减分别对应 OP 和 Invop 。
+//
+//  AddTo 方法是将指定的值加到计数器当前的值上。例如：
+//  ```
+//      bvar::Adder<int> counter("counter");
+//      counter << 1;  // 将 1 加到计数器当前的值上
+//  ```
+//
+//  MinusFrom 方法是从计数器当前的值中减去指定的值。例如：
+//  ```
+//      bvar::Adder<int> counter("counter");
+//      counter.MinusFrom(1);  // 从计数器当前的值中减去 1
+//  ```
 template <typename T>
 class Adder : public Reducer<T, detail::AddTo<T>, detail::MinusFrom<T> > {
 public:
+
     typedef Reducer<T, detail::AddTo<T>, detail::MinusFrom<T> > Base;
     typedef T value_type;
     typedef typename Base::sampler_type sampler_type;
+
 public:
+    // 三个构造函数分别对应不曝光、不指定前缀曝光和指定前缀曝光的场景，分别会调用 Reducer 的构造函数。
     Adder() : Base() {}
     explicit Adder(const butil::StringPiece& name) : Base() {
         this->expose(name);
     }
-    Adder(const butil::StringPiece& prefix,
-          const butil::StringPiece& name) : Base() {
+    Adder(const butil::StringPiece& prefix, const butil::StringPiece& name) : Base() {
         this->expose_as(prefix, name);
     }
     ~Adder() { Variable::hide(); }
 };
+
+
 
 // bvar::Maxer<int> max_value;
 // max_value << 1 << 2 << 3 << 4;

@@ -387,9 +387,12 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
         // user function is never called, the variables will be unchanged
         // however they'd better reflect failures because the task is stopped
         // abnormally.
+        //
+        // 任务可以在开始运行之前被停止，这种情况下我们可能会跳过用户函数，但这可能会让用户感到困惑：
+        // 大多数任务都有变量来记住任务的运行结果，这些变量通常被初始化为表示成功的值。
+        // 如果用户函数从未被调用，这些变量将不会改变，然而它们最好反映出失败，因为任务被异常终止了。
 
         // Meta and identifier of the task is persistent in this run.
-        //
         // 通过 TLS 获取当前线程待执行的任务 TaskMeta
         TaskMeta* const m = g->_cur_meta;
 
@@ -415,6 +418,7 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
         }
 
         // Group is probably changed
+        // 因为 fn 执行过程中，可能调用 sleep 而被迁移到其它 pthread ，当恢复执行后，需要重置为当时线程对应的 task_group 。
         g = BAIDU_GET_VOLATILE_THREAD_LOCAL(tls_task_group);
 
         // TODO: Save thread_return
@@ -440,6 +444,7 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
             m->local_storage.keytable = NULL; // optional
         }
 
+
         // Increase the version and wake up all joiners, if resulting version
         // is 0, change it to 1 to make bthread_t never be 0. Any access
         // or join to the bthread after changing version will be rejected.
@@ -456,13 +461,15 @@ void TaskGroup::task_runner(intptr_t skip_remained) {
         // 唤醒 joiner
         butex_wake_except(m->version_butex, 0);
 
-        // _nbthreads 减 1
+        // 协程执行完毕：_nbthreads 减 1
         g->_control->_nbthreads << -1;
+        // 协程执行完毕：需要销毁栈
         g->set_remained(TaskGroup::_release_last_context, m);
 
         // 查找下一个任务，并切换到其对应的运行时上下文
         ending_sched(&g);
 
+    //
     } while (g->_cur_meta->tid != g->_main_tid);
 
     // Was called from a pthread and we don't have BTHREAD_STACKTYPE_PTHREAD
@@ -639,9 +646,13 @@ TaskStatistics TaskGroup::main_stat() const {
     return m ? m->stat : EMPTY_STAT;
 }
 
+// 当前 bthread 执行完后会优先从本地获取下一个 bthread ，如果没有则从其他 taskgroup 偷取 bthread 来执行，获取成功后又重新调度。
+// 如果没有获取到 bthread 则进入 main_task 开始等待。
+//
 void TaskGroup::ending_sched(TaskGroup** pg) {
     TaskGroup* g = *pg;
     bthread_t next_tid = 0;
+
     // Find next task to run, if none, switch to idle thread of the group.
 #ifndef BTHREAD_FAIR_WSQ
     // When BTHREAD_FAIR_WSQ is defined, profiling shows that cpu cost of
@@ -651,20 +662,26 @@ void TaskGroup::ending_sched(TaskGroup** pg) {
 #else
     const bool popped = g->_rq.steal(&next_tid);
 #endif
+
+    // 如果本地 running_queue(g->_rq) 中没有就绪协程、且 g->_remote_rq 也没有、且其它 task_group 也无，才会设置成 main_tid 。
     if (!popped && !g->steal_task(&next_tid)) {
         // Jump to main task if there's no task to run.
         next_tid = g->_main_tid;
     }
 
+    // 获取当前协程的 meta , 可能之后要被回收了。
     TaskMeta* const cur_meta = g->_cur_meta;
+    // 获取下个协程的 meta ，准备跳转过去
     TaskMeta* next_meta = address_meta(next_tid);
+    // 需要创建协程栈
     if (next_meta->stack == NULL) {
+        // 若 next_meta 没有栈且需要的栈类型和 cur_meta 一致，那么直接让 next_meta 使用 cur_meta 的栈，节省释放和重新分配的开销。
         if (next_meta->stack_type() == cur_meta->stack_type()) {
             // also works with pthread_task scheduling to pthread_task, the
             // transfered stack is just _main_stack.
             next_meta->set_stack(cur_meta->release_stack());
         } else {
-
+            // 新初始化一个栈，起始函数为 task_runner ，第一次 jump 到这个栈的时候调用。
             ContextualStack* stk = get_stack(next_meta->stack_type(), task_runner);
             if (stk) {
                 next_meta->set_stack(stk);
@@ -673,11 +690,15 @@ void TaskGroup::ending_sched(TaskGroup** pg) {
                 // In latter case, attr is forced to be BTHREAD_STACKTYPE_PTHREAD.
                 // This basically means that if we can't allocate stack, run
                 // the task in pthread directly.
+                //
+                // 可能没有足够的内存支持 mmap 或者栈类型本身就是 pthread 的，直接用工作线程的栈执行。
                 next_meta->attr.stack_type = BTHREAD_STACKTYPE_PTHREAD;
                 next_meta->set_stack(g->_main_stack);
             }
         }
     }
+
+    //
     sched_to(pg, next_meta);
 }
 
@@ -826,15 +847,17 @@ void TaskGroup::destroy_self() {
 }
 
 void TaskGroup::ready_to_run(bthread_t tid, bool nosignal) {
-    //
+    // 保存到 running queue 的尾部
     push_rq(tid);
+    // 是否需要信号通知
     if (nosignal) {
-        ++_num_nosignal; // 对于设定了不触发信号的任务，仅增加计数
+        // 不通知，仅增加计数
+        ++_num_nosignal;
     } else {
+        // 通知，重置计数并触发信号
         const int additional_signal = _num_nosignal;
         _num_nosignal = 0;
         _nsignaled += 1 + additional_signal;
-        // 调用 signal_task 唤醒
         _control->signal_task(1 + additional_signal);
     }
 }
@@ -849,7 +872,6 @@ void TaskGroup::flush_nosignal_tasks() {
     }
 }
 
-
 // 本函数的作用是将 tid 标识的线程加入到远程任务队列中，如果任务队列已满，则进行等待，并在一定时间间隔后重试。
 // 如果 nosignal 设置为 true ，表示当前线程不需要接收信号，否则会给其它线程发送信号。
 void TaskGroup::ready_to_run_remote(bthread_t tid, bool nosignal) {
@@ -859,7 +881,7 @@ void TaskGroup::ready_to_run_remote(bthread_t tid, bool nosignal) {
     //
     // while 循环入队，失败就执行 flush_nosignal_tasks_remote_locked() 然后休眠 1ms ，然后重新尝试入队。
     // 这里入队失败的唯一原因就是 remote_rq 的容量满了。flush_nosignal_tasks_remote_locked() 的操作也无非就是发出一个信号，
-    // 让 remote_rq 中的任务（TM/bthread) 尽快被消费掉，给新的任务入队留出空间。
+    // 让 remote_rq 中的任务（TaskMeta/bthread) 尽快被消费掉，给新的任务入队留出空间。
     // 另外 flush_nosignal_tasks_remote_locked() 内会做解锁操作，所以休眠 1ms 之后需要重新加锁。
     while (!_remote_rq.push_locked(tid)) {
         flush_nosignal_tasks_remote_locked(_remote_rq._mutex);
@@ -868,8 +890,6 @@ void TaskGroup::ready_to_run_remote(bthread_t tid, bool nosignal) {
         _remote_rq._mutex.lock();
     }
     // 在 while 结束之后，表示新任务已经入队。
-
-
 
     // 是否需要发送信号通知有新的任务可以处理。
     if (nosignal) {
@@ -916,6 +936,8 @@ void TaskGroup::flush_nosignal_tasks_general() {
 
 void TaskGroup::ready_to_run_in_worker(void* args_in) {
     ReadyToRunArgs* args = static_cast<ReadyToRunArgs*>(args_in);
+    // tls_task_group 是一个指向当前线程私有变量的指针，用于管理当前线程所处的任务组。
+    // ready_to_run 方法是 TaskGroup 类的一个方法，用于将任务标记为“就绪状态”，并将其添加到任务队列中等待执行。
     return tls_task_group->ready_to_run(args->tid, args->nosignal);
 }
 
